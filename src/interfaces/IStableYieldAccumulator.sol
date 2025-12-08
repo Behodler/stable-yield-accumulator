@@ -67,15 +67,20 @@ interface IStableYieldAccumulator {
     event DiscountRateSet(uint256 oldRate, uint256 newRate);
 
     /**
+     * @notice Emitted when the phlimbo address is updated
+     * @param oldPhlimbo Previous phlimbo address
+     * @param newPhlimbo New phlimbo address
+     */
+    event PhlimboUpdated(address indexed oldPhlimbo, address indexed newPhlimbo);
+
+    /**
      * @notice Emitted when a user claims rewards
      * @param claimer Address that performed the claim
-     * @param rewardToken Token used to pay for the claim
      * @param amountPaid Amount of reward token paid
      * @param strategiesClaimed Number of strategies claimed from
      */
     event RewardsClaimed(
         address indexed claimer,
-        address indexed rewardToken,
         uint256 amountPaid,
         uint256 strategiesClaimed
     );
@@ -206,23 +211,37 @@ interface IStableYieldAccumulator {
     function getDiscountRate() external view returns (uint256);
 
     /*//////////////////////////////////////////////////////////////
+                        PHLIMBO MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Sets the phlimbo address where claimed reward tokens are transferred
+     * @param _phlimbo Address of the Phlimbo contract
+     */
+    function setPhlimbo(address _phlimbo) external;
+
+    /**
+     * @notice Gets the current phlimbo address
+     * @return Address of the Phlimbo contract
+     */
+    function phlimbo() external view returns (address);
+
+    /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
     //////////////////////////////////////////////////////////////*/
 
     /**
      * @notice Claims pending yield from all strategies by paying with reward token
-     * @param token Token to use for payment
      * @param amount Amount of reward token to pay
      */
-    function claim(address token, uint256 amount) external;
+    function claim(uint256 amount) external;
 
     /**
      * @notice Calculates how much can be claimed for a given input amount
-     * @param token Token that would be used for payment
      * @param inputAmount Amount of reward token to pay
      * @return Amount that can be claimed
      */
-    function calculateClaimAmount(address token, uint256 inputAmount)
+    function calculateClaimAmount(uint256 inputAmount)
         external
         view
         returns (uint256);
