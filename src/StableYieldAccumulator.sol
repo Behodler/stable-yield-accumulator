@@ -3,8 +3,11 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "pauser/interfaces/IPausable.sol";
 import "./interfaces/IStableYieldAccumulator.sol";
+import "vault/interfaces/IYieldStrategy.sol";
 
 /**
  * @title StableYieldAccumulator
@@ -47,6 +50,8 @@ import "./interfaces/IStableYieldAccumulator.sol";
  * 4. **Claim Mechanism** - External users swap their reward token holdings for pending yield strategy rewards
  */
 contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAccumulator {
+    using SafeERC20 for IERC20;
+
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -90,10 +95,22 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
     address public phlimbo;
 
     /**
+     * @notice Address of the minter contract that holds deposits in yield strategies
+     * @dev Used to query yield strategies for the minter's accumulated yield
+     */
+    address public minterAddress;
+
+    /**
      * @notice Mapping to check if a strategy is registered (O(1) lookup)
      * @dev Used to avoid O(n) iteration for duplicate/existence checks
      */
     mapping(address => bool) public isRegisteredStrategy;
+
+    /**
+     * @notice Mapping from strategy address to its underlying token address
+     * @dev Each yield strategy handles a specific token (e.g., USDC, USDT, DAI)
+     */
+    mapping(address => address) public strategyTokens;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -105,6 +122,13 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
      * @param newPauser New pauser address (may be address(0) to remove pauser)
      */
     event PauserUpdated(address indexed oldPauser, address indexed newPauser);
+
+    /**
+     * @notice Emitted when the minter address is updated
+     * @param oldMinter Previous minter address (may be address(0))
+     * @param newMinter New minter address
+     */
+    event MinterUpdated(address indexed oldMinter, address indexed newMinter);
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -198,13 +222,16 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
      * @notice Adds a new yield strategy to the registry
      * @dev Validates zero address and duplicate registration
      * @param strategy Address of the yield strategy to add
+     * @param token Address of the underlying token that the strategy handles
      */
-    function addYieldStrategy(address strategy) external override onlyOwner {
+    function addYieldStrategy(address strategy, address token) external override onlyOwner {
         if (strategy == address(0)) revert ZeroAddress();
+        if (token == address(0)) revert ZeroAddress();
         if (isRegisteredStrategy[strategy]) revert StrategyAlreadyRegistered();
 
         yieldStrategies.push(strategy);
         isRegisteredStrategy[strategy] = true;
+        strategyTokens[strategy] = token;
         emit YieldStrategyAdded(strategy);
     }
 
@@ -227,6 +254,7 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
         }
 
         isRegisteredStrategy[strategy] = false;
+        delete strategyTokens[strategy];
         emit YieldStrategyRemoved(strategy);
     }
 
@@ -334,6 +362,29 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
         emit PhlimboUpdated(oldPhlimbo, _phlimbo);
     }
 
+    /**
+     * @notice Sets the minter address that holds deposits in yield strategies
+     * @dev Used for querying yield from strategies
+     * @param _minter Address of the minter contract
+     */
+    function setMinter(address _minter) external onlyOwner {
+        if (_minter == address(0)) revert ZeroAddress();
+
+        address oldMinter = minterAddress;
+        minterAddress = _minter;
+        emit MinterUpdated(oldMinter, _minter);
+    }
+
+    /**
+     * @notice Sets the reward token address
+     * @dev This is the single stablecoin used for consolidated reward distribution
+     * @param _rewardToken Address of the reward token (e.g., USDC)
+     */
+    function setRewardToken(address _rewardToken) external onlyOwner {
+        if (_rewardToken == address(0)) revert ZeroAddress();
+        rewardToken = _rewardToken;
+    }
+
     /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
     //////////////////////////////////////////////////////////////*/
@@ -346,10 +397,15 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
     function claim(uint256 amount) external override whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         if (phlimbo == address(0)) revert ZeroAddress();
+        if (rewardToken == address(0)) revert ZeroAddress();
 
-        // Transfer reward tokens to phlimbo
-        // Note: This is a simplified implementation
-        // In production, would use SafeERC20.safeTransfer
+        // Verify this contract has sufficient balance
+        uint256 balance = IERC20(rewardToken).balanceOf(address(this));
+        if (balance < amount) revert InsufficientPending();
+
+        // Transfer reward tokens from this contract to phlimbo
+        IERC20(rewardToken).safeTransfer(phlimbo, amount);
+
         emit RewardsClaimed(msg.sender, amount, yieldStrategies.length);
     }
 
@@ -384,8 +440,20 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
      */
     function getYield(address strategy) external view override returns (uint256) {
         if (!isRegisteredStrategy[strategy]) revert StrategyNotRegistered();
-        // Simplified: Yield strategies track their own balances
-        // In production: would call strategy.getPendingYield() or similar
+        if (minterAddress == address(0)) return 0;
+
+        address token = strategyTokens[strategy];
+        if (token == address(0)) return 0;
+
+        // Query the yield strategy for minter's total balance and principal
+        IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
+        uint256 totalBalance = yieldStrategy.totalBalanceOf(token, minterAddress);
+        uint256 principal = yieldStrategy.principalOf(token, minterAddress);
+
+        // Yield = total balance - principal (accumulated yield)
+        if (totalBalance > principal) {
+            return totalBalance - principal;
+        }
         return 0;
     }
 
@@ -395,11 +463,22 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
      * @return Total pending yield amount
      */
     function getTotalYield() external view override returns (uint256) {
+        if (minterAddress == address(0)) return 0;
+
         uint256 total = 0;
         for (uint256 i = 0; i < yieldStrategies.length; i++) {
-            // In production, would query each strategy
-            // For now, simplified implementation returns 0
-            total += 0;
+            address strategy = yieldStrategies[i];
+            address token = strategyTokens[strategy];
+            if (token == address(0)) continue;
+
+            // Query each strategy for minter's yield
+            IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
+            uint256 totalBalance = yieldStrategy.totalBalanceOf(token, minterAddress);
+            uint256 principal = yieldStrategy.principalOf(token, minterAddress);
+
+            if (totalBalance > principal) {
+                total += totalBalance - principal;
+            }
         }
         return total;
     }

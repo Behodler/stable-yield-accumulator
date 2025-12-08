@@ -148,8 +148,9 @@ interface IStableYieldAccumulator {
     /**
      * @notice Adds a new yield strategy to the registry
      * @param strategy Address of the yield strategy to add
+     * @param token Address of the underlying token that the strategy handles
      */
-    function addYieldStrategy(address strategy) external;
+    function addYieldStrategy(address strategy, address token) external;
 
     /**
      * @notice Removes a yield strategy from the registry
@@ -225,6 +226,18 @@ interface IStableYieldAccumulator {
      * @return Address of the Phlimbo contract
      */
     function phlimbo() external view returns (address);
+
+    /**
+     * @notice Sets the minter address that holds deposits in yield strategies
+     * @param _minter Address of the minter contract
+     */
+    function setMinter(address _minter) external;
+
+    /**
+     * @notice Gets the current minter address
+     * @return Address of the minter contract
+     */
+    function minterAddress() external view returns (address);
 
     /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
