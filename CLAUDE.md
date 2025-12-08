@@ -6,6 +6,55 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a Foundry smart contract submodule for the StableYieldAccumulator contract.
 
+## Purpose and Architecture
+
+### Problem Statement
+
+In the Phoenix architecture, multiple yield strategies exist, each corresponding to a different stablecoin. Phlimbo distributes these rewards, but as yield strategies grow in number, this becomes unwieldy and gas-intensive. Additionally, Limbo stakers would need to manage many different reward tokens.
+
+### Solution
+
+StableYieldAccumulator consolidates all yield strategy rewards into a single stablecoin before Phlimbo distribution. This provides:
+
+1. **Simplified rewards** - Limbo stakers only deal with 2 tokens: phUSD and one stablecoin
+2. **Future-proof Phlimbo** - No upgrades/migrations needed when yield strategies change
+3. **Decentralized conversion** - External actors perform the token swaps, not the protocol
+
+### How It Works
+
+1. **Yield Strategy Registry** - Maintains a dynamic list of yield strategies
+2. **Exchange Rate Mappings** - Tracks decimal places (6 for USDC, 18 for Dola, etc.) and exchange rates
+3. **No Oracles/AMMs** - Uses assumed 1:1 exchange rates for stablecoins (owner can adjust for permanent depegs)
+4. **Claim Mechanism** - External users swap their reward token holdings for pending yield strategy rewards
+
+### Claim Example
+
+Assumptions:
+- Reward token: USDC
+- Yield Strategy A: 10 USDT pending
+- Yield Strategy B: 5 USDS pending
+- Exchange rates: 1:1
+- Discount rate: 2%
+
+Process:
+1. Total pending = 15 USD equivalent
+2. With 2% discount, claimer pays: 15 * 0.98 = 14.7 USDC
+3. Claimer receives: 10 USDT + 5 USDS
+4. Phlimbo receives: 14.7 USDC for distribution
+
+The discount incentivizes external actors to pay gas costs for the conversion.
+
+### Key Components
+
+1. **Yield Strategy List** - Dynamic, owner-managed list of yield strategies
+2. **Token Config Mapping** - Per-token: decimals, exchange rate, paused status
+3. **Global Discount Rate** - Incentive for claimers (e.g., 2%)
+4. **Owner Controls**:
+   - Add/remove yield strategies
+   - Update exchange rates (for permanent depegs)
+   - Pause tokens (for black swan events)
+   - Set discount rate
+
 ## Dependency Management
 
 ### Types of Dependencies
