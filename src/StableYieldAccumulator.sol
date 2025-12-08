@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "pauser/interfaces/IPausable.sol";
+import "./interfaces/IStableYieldAccumulator.sol";
 
 /**
  * @title StableYieldAccumulator
@@ -45,7 +46,7 @@ import "pauser/interfaces/IPausable.sol";
  * 3. **No Oracles/AMMs** - Uses assumed 1:1 exchange rates for stablecoins (owner can adjust for permanent depegs)
  * 4. **Claim Mechanism** - External users swap their reward token holdings for pending yield strategy rewards
  */
-contract StableYieldAccumulator is Ownable, Pausable, IPausable {
+contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAccumulator {
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -57,6 +58,36 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable {
      *      The public visibility satisfies IPausable.pauser() getter requirement
      */
     address public pauser;
+
+    /**
+     * @notice The single stablecoin used for consolidated reward distribution
+     * @dev This is the token that claimers pay with to receive yield strategy rewards
+     */
+    address public rewardToken;
+
+    /**
+     * @notice Dynamic array tracking all registered yield strategies
+     * @dev Used to iterate over strategies for yield collection and calculation
+     */
+    address[] public yieldStrategies;
+
+    /**
+     * @notice Mapping of token addresses to their configuration
+     * @dev Stores decimals, normalized exchange rate, and pause status for each token
+     */
+    mapping(address => TokenConfig) public tokenConfigs;
+
+    /**
+     * @notice Global discount rate applied to all claims
+     * @dev Stored in basis points (e.g., 200 = 2%), max 10000 (100%)
+     */
+    uint256 public discountRate;
+
+    /**
+     * @notice Tracks the original principal deposited to each yield strategy
+     * @dev Used to calculate yield as: totalDeposits - principalDeposited
+     */
+    mapping(address => uint256) public principalDeposited;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -154,12 +185,167 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable {
     }
 
     /*//////////////////////////////////////////////////////////////
-                    FUTURE STATE-CHANGING FUNCTIONS
+                    YIELD STRATEGY MANAGEMENT
     //////////////////////////////////////////////////////////////*/
 
-    // Future functions like deposit(), withdraw(), claim(), etc. will be protected with whenNotPaused
-    // Example:
-    // function deposit(uint256 amount) external whenNotPaused {
-    //     // deposit logic
-    // }
+    /**
+     * @notice Adds a new yield strategy to the registry
+     * @dev RED PHASE STUB - Reverts with NotImplemented()
+     * @param strategy Address of the yield strategy to add
+     */
+    function addYieldStrategy(address strategy) external override onlyOwner {
+        revert NotImplemented();
+    }
+
+    /**
+     * @notice Removes a yield strategy from the registry
+     * @dev RED PHASE STUB - Reverts with NotImplemented()
+     * @param strategy Address of the yield strategy to remove
+     */
+    function removeYieldStrategy(address strategy) external override onlyOwner {
+        revert NotImplemented();
+    }
+
+    /**
+     * @notice Gets all registered yield strategies
+     * @dev RED PHASE STUB - Returns empty array
+     * @return Empty array of yield strategy addresses
+     */
+    function getYieldStrategies() external view override returns (address[] memory) {
+        address[] memory empty;
+        return empty;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        TOKEN CONFIGURATION
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Sets or updates the configuration for a token
+     * @dev RED PHASE STUB - Reverts with NotImplemented()
+     * @param token Address of the token
+     * @param decimals Number of decimal places
+     * @param normalizedExchangeRate Exchange rate normalized to 18 decimals
+     */
+    function setTokenConfig(address token, uint8 decimals, uint256 normalizedExchangeRate)
+        external
+        override
+        onlyOwner
+    {
+        revert NotImplemented();
+    }
+
+    /**
+     * @notice Pauses a token, preventing claims with it
+     * @dev RED PHASE STUB - Reverts with NotImplemented()
+     * @param token Address of the token to pause
+     */
+    function pauseToken(address token) external override onlyOwner {
+        revert NotImplemented();
+    }
+
+    /**
+     * @notice Unpauses a token, allowing claims with it
+     * @dev RED PHASE STUB - Reverts with NotImplemented()
+     * @param token Address of the token to unpause
+     */
+    function unpauseToken(address token) external override onlyOwner {
+        revert NotImplemented();
+    }
+
+    /**
+     * @notice Gets the configuration for a token
+     * @dev RED PHASE STUB - Returns empty/zero values
+     * @param token Address of the token
+     * @return Empty TokenConfig struct
+     */
+    function getTokenConfig(address token) external view override returns (TokenConfig memory) {
+        TokenConfig memory empty;
+        return empty;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            DISCOUNT RATE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Sets the discount rate for claims
+     * @dev RED PHASE STUB - Reverts with NotImplemented()
+     * @param rate Discount rate in basis points
+     */
+    function setDiscountRate(uint256 rate) external override onlyOwner {
+        revert NotImplemented();
+    }
+
+    /**
+     * @notice Gets the current discount rate
+     * @dev RED PHASE STUB - Returns 0
+     * @return Zero
+     */
+    function getDiscountRate() external view override returns (uint256) {
+        return 0;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            CLAIM MECHANISM
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Claims pending yield from all strategies by paying with reward token
+     * @dev RED PHASE STUB - Reverts with NotImplemented()
+     * @param token Token to use for payment
+     * @param amount Amount of reward token to pay
+     */
+    function claim(address token, uint256 amount) external override whenNotPaused {
+        revert NotImplemented();
+    }
+
+    /**
+     * @notice Calculates how much can be claimed for a given input amount
+     * @dev RED PHASE STUB - Returns 0
+     * @param token Token that would be used for payment
+     * @param inputAmount Amount of reward token to pay
+     * @return Zero
+     */
+    function calculateClaimAmount(address token, uint256 inputAmount)
+        external
+        view
+        override
+        returns (uint256)
+    {
+        return 0;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        YIELD CALCULATION
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Gets the pending yield for a specific strategy
+     * @dev RED PHASE STUB - Returns 0
+     * @param strategy Address of the yield strategy
+     * @return Zero
+     */
+    function getYield(address strategy) external view override returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @notice Gets the total pending yield across all strategies
+     * @dev RED PHASE STUB - Returns 0
+     * @return Zero
+     */
+    function getTotalYield() external view override returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @notice Updates the principal amount for a strategy
+     * @dev RED PHASE STUB - Does nothing
+     * @param strategy Address of the yield strategy
+     * @param amount Amount to track
+     */
+    function updatePrincipal(address strategy, uint256 amount) internal {
+        // Stub - will be implemented in green phase
+    }
 }
