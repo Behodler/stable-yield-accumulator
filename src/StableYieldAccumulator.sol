@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "pauser/interfaces/IPausable.sol";
@@ -49,7 +50,7 @@ import "vault/interfaces/IYieldStrategy.sol";
  * 3. **No Oracles/AMMs** - Uses assumed 1:1 exchange rates for stablecoins (owner can adjust for permanent depegs)
  * 4. **Claim Mechanism** - External users swap their reward token holdings for pending yield strategy rewards
  */
-contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAccumulator {
+contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable, IStableYieldAccumulator {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -403,59 +404,43 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
      * - Claimer pays: 15 * 0.98 = 14.7 USDC to phlimbo
      * - Claimer receives: 10 USDT + 5 USDS from strategies
      */
-    function claim() external override whenNotPaused {
+    function claim() external override whenNotPaused nonReentrant {
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
         if (minterAddress == address(0)) revert ZeroAddress();
 
-        // Calculate total pending yield (normalized to 18 decimals)
         uint256 totalNormalizedYield = 0;
         uint256 strategiesWithYield = 0;
 
-        // First pass: calculate total yield and count strategies with yield
+        // Single pass: withdraw yield from each strategy and accumulate total
         for (uint256 i = 0; i < yieldStrategies.length; i++) {
             address strategy = yieldStrategies[i];
             address token = strategyTokens[strategy];
             if (token == address(0)) continue;
 
-            // Check if token is paused
             if (tokenConfigs[token].paused) revert TokenIsPaused();
-
-            uint256 yield = _getYieldForStrategy(strategy, token);
-            if (yield > 0) {
-                // Normalize yield to 18 decimals using token config
-                uint256 normalizedYield = _normalizeAmount(yield, token);
-                totalNormalizedYield += normalizedYield;
-                strategiesWithYield++;
-            }
-        }
-
-        if (totalNormalizedYield == 0) revert ZeroAmount();
-
-        // Calculate claimer payment (apply discount)
-        // discountRate is in basis points (e.g., 200 = 2%)
-        // claimer pays: totalYield * (10000 - discountRate) / 10000
-        uint256 claimerPayment = totalNormalizedYield * (10000 - discountRate) / 10000;
-
-        // Denormalize to reward token decimals for actual transfer
-        uint256 actualPayment = _denormalizeAmount(claimerPayment, rewardToken);
-
-        // Transfer reward tokens FROM claimer TO phlimbo
-        IERC20(rewardToken).safeTransferFrom(msg.sender, phlimbo, actualPayment);
-
-        // Second pass: withdraw yield from each strategy to claimer
-        for (uint256 i = 0; i < yieldStrategies.length; i++) {
-            address strategy = yieldStrategies[i];
-            address token = strategyTokens[strategy];
-            if (token == address(0)) continue;
 
             uint256 yield = _getYieldForStrategy(strategy, token);
             if (yield > 0) {
                 // Withdraw yield from strategy to claimer
                 IYieldStrategy(strategy).withdrawFrom(token, minterAddress, yield, msg.sender);
                 emit RewardsCollected(strategy, yield);
+
+                // Accumulate normalized yield for payment calculation
+                totalNormalizedYield += _normalizeAmount(yield, token);
+                strategiesWithYield++;
             }
         }
+
+        if (totalNormalizedYield == 0) revert ZeroAmount();
+
+        // Calculate and collect claimer payment (apply discount)
+        // discountRate is in basis points (e.g., 200 = 2%)
+        uint256 claimerPayment = totalNormalizedYield * (10000 - discountRate) / 10000;
+        uint256 actualPayment = _denormalizeAmount(claimerPayment, rewardToken);
+
+        // Transfer reward tokens FROM claimer TO phlimbo
+        IERC20(rewardToken).safeTransferFrom(msg.sender, phlimbo, actualPayment);
 
         emit RewardsClaimed(msg.sender, actualPayment, strategiesWithYield);
     }
