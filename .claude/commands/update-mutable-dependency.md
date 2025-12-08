@@ -19,3 +19,5 @@ Updates an existing mutable dependency to pull the latest interface changes.
 ## When to Use
 - After a sibling submodule has implemented your change requests
 - To sync with the latest interface definitions
+
+ARGUMENTS: $ARGUMENTS

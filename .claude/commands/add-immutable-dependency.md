@@ -17,3 +17,5 @@ Adds an external library as an immutable dependency with full source access.
 ## Important Notes
 - Use this for external libraries that won't change based on sibling requirements
 - Full source code is available for these dependencies
+
+ARGUMENTS: $ARGUMENTS

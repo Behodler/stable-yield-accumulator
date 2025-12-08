@@ -20,3 +20,5 @@ Adds a sibling submodule as a mutable dependency, exposing only interfaces.
 - Mutable dependencies only expose interfaces and abstract contracts
 - Implementation details are automatically stripped
 - If the dependency lacks an interfaces directory, the operation fails
+
+ARGUMENTS: $ARGUMENTS

@@ -18,3 +18,5 @@ Reviews and processes incoming change requests from sibling submodules.
 3. Update interfaces as needed
 4. Commit and push changes
 5. Notify requesting submodules to update their dependencies
+
+ARGUMENTS: $ARGUMENTS
