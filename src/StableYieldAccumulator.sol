@@ -390,41 +390,190 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Claims pending yield from all strategies by paying with reward token
-     * @dev Transfers rewardToken from this contract to phlimbo
-     * @param amount Amount of reward token to pay
+     * @notice Claims all pending yield from all strategies by paying with reward token
+     * @dev Full claim flow:
+     *      1. Calculate total pending yield across all strategies (normalized to 18 decimals)
+     *      2. Apply discount to get claimer payment amount
+     *      3. Transfer rewardToken FROM claimer TO phlimbo
+     *      4. Withdraw yield FROM each strategy TO claimer
+     *
+     * Example with 2% discount:
+     * - Strategy A has 10 USDT pending, Strategy B has 5 USDS pending
+     * - Total = 15 USD equivalent (normalized)
+     * - Claimer pays: 15 * 0.98 = 14.7 USDC to phlimbo
+     * - Claimer receives: 10 USDT + 5 USDS from strategies
      */
-    function claim(uint256 amount) external override whenNotPaused {
-        if (amount == 0) revert ZeroAmount();
+    function claim() external override whenNotPaused {
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
+        if (minterAddress == address(0)) revert ZeroAddress();
 
-        // Verify this contract has sufficient balance
-        uint256 balance = IERC20(rewardToken).balanceOf(address(this));
-        if (balance < amount) revert InsufficientPending();
+        // Calculate total pending yield (normalized to 18 decimals)
+        uint256 totalNormalizedYield = 0;
+        uint256 strategiesWithYield = 0;
 
-        // Transfer reward tokens from this contract to phlimbo
-        IERC20(rewardToken).safeTransfer(phlimbo, amount);
+        // First pass: calculate total yield and count strategies with yield
+        for (uint256 i = 0; i < yieldStrategies.length; i++) {
+            address strategy = yieldStrategies[i];
+            address token = strategyTokens[strategy];
+            if (token == address(0)) continue;
 
-        emit RewardsClaimed(msg.sender, amount, yieldStrategies.length);
+            // Check if token is paused
+            if (tokenConfigs[token].paused) revert TokenIsPaused();
+
+            uint256 yield = _getYieldForStrategy(strategy, token);
+            if (yield > 0) {
+                // Normalize yield to 18 decimals using token config
+                uint256 normalizedYield = _normalizeAmount(yield, token);
+                totalNormalizedYield += normalizedYield;
+                strategiesWithYield++;
+            }
+        }
+
+        if (totalNormalizedYield == 0) revert ZeroAmount();
+
+        // Calculate claimer payment (apply discount)
+        // discountRate is in basis points (e.g., 200 = 2%)
+        // claimer pays: totalYield * (10000 - discountRate) / 10000
+        uint256 claimerPayment = totalNormalizedYield * (10000 - discountRate) / 10000;
+
+        // Denormalize to reward token decimals for actual transfer
+        uint256 actualPayment = _denormalizeAmount(claimerPayment, rewardToken);
+
+        // Transfer reward tokens FROM claimer TO phlimbo
+        IERC20(rewardToken).safeTransferFrom(msg.sender, phlimbo, actualPayment);
+
+        // Second pass: withdraw yield from each strategy to claimer
+        for (uint256 i = 0; i < yieldStrategies.length; i++) {
+            address strategy = yieldStrategies[i];
+            address token = strategyTokens[strategy];
+            if (token == address(0)) continue;
+
+            uint256 yield = _getYieldForStrategy(strategy, token);
+            if (yield > 0) {
+                // Withdraw yield from strategy to claimer
+                IYieldStrategy(strategy).withdrawFrom(token, minterAddress, yield, msg.sender);
+                emit RewardsCollected(strategy, yield);
+            }
+        }
+
+        emit RewardsClaimed(msg.sender, actualPayment, strategiesWithYield);
     }
 
     /**
-     * @notice Calculates how much can be claimed for a given input amount
-     * @dev Applies discount rate: claimAmount = inputAmount * (10000 - discountRate) / 10000
-     * @param inputAmount Amount of reward token to pay
-     * @return Amount that can be claimed after discount
+     * @notice Internal helper to get yield for a specific strategy
+     * @param strategy Address of the yield strategy
+     * @param token Address of the strategy's underlying token
+     * @return yield The pending yield amount
      */
-    function calculateClaimAmount(uint256 inputAmount)
+    function _getYieldForStrategy(address strategy, address token) internal view returns (uint256) {
+        IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
+        uint256 totalBalance = yieldStrategy.totalBalanceOf(token, minterAddress);
+        uint256 principal = yieldStrategy.principalOf(token, minterAddress);
+
+        if (totalBalance > principal) {
+            return totalBalance - principal;
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Normalizes an amount from token decimals to 18 decimals
+     * @param amount The amount in token decimals
+     * @param token The token address to get decimals from
+     * @return The amount normalized to 18 decimals
+     */
+    function _normalizeAmount(uint256 amount, address token) internal view returns (uint256) {
+        uint8 decimals = tokenConfigs[token].decimals;
+        uint256 exchangeRate = tokenConfigs[token].normalizedExchangeRate;
+
+        // If no config set, assume 18 decimals and 1:1 rate
+        if (decimals == 0 && exchangeRate == 0) {
+            return amount;
+        }
+
+        // Scale to 18 decimals
+        uint256 scaled = amount;
+        if (decimals < 18) {
+            scaled = amount * (10 ** (18 - decimals));
+        } else if (decimals > 18) {
+            scaled = amount / (10 ** (decimals - 18));
+        }
+
+        // Apply exchange rate (already normalized to 18 decimals)
+        // exchangeRate of 1e18 means 1:1
+        if (exchangeRate > 0 && exchangeRate != 1e18) {
+            scaled = scaled * exchangeRate / 1e18;
+        }
+
+        return scaled;
+    }
+
+    /**
+     * @notice Denormalizes an amount from 18 decimals to token decimals
+     * @param amount The amount in 18 decimals
+     * @param token The token address to get decimals from
+     * @return The amount in token decimals
+     */
+    function _denormalizeAmount(uint256 amount, address token) internal view returns (uint256) {
+        uint8 decimals = tokenConfigs[token].decimals;
+        uint256 exchangeRate = tokenConfigs[token].normalizedExchangeRate;
+
+        // If no config set, assume 18 decimals and 1:1 rate
+        if (decimals == 0 && exchangeRate == 0) {
+            return amount;
+        }
+
+        // Reverse exchange rate first
+        uint256 scaled = amount;
+        if (exchangeRate > 0 && exchangeRate != 1e18) {
+            scaled = scaled * 1e18 / exchangeRate;
+        }
+
+        // Scale from 18 decimals to token decimals
+        if (decimals < 18) {
+            scaled = scaled / (10 ** (18 - decimals));
+        } else if (decimals > 18) {
+            scaled = scaled * (10 ** (decimals - 18));
+        }
+
+        return scaled;
+    }
+
+    /**
+     * @notice Calculates how much the claimer would pay for total pending yield
+     * @dev Returns the discounted amount in reward token that claimer would pay
+     * @return paymentAmount Amount of reward token claimer would pay (in reward token decimals)
+     */
+    function calculateClaimAmount()
         external
         view
         override
         returns (uint256)
     {
-        if (discountRate == 0) {
-            return inputAmount;
+        if (minterAddress == address(0)) return 0;
+
+        uint256 totalNormalizedYield = 0;
+
+        for (uint256 i = 0; i < yieldStrategies.length; i++) {
+            address strategy = yieldStrategies[i];
+            address token = strategyTokens[strategy];
+            if (token == address(0)) continue;
+            if (tokenConfigs[token].paused) continue;
+
+            uint256 yield = _getYieldForStrategy(strategy, token);
+            if (yield > 0) {
+                totalNormalizedYield += _normalizeAmount(yield, token);
+            }
         }
-        return inputAmount * (10000 - discountRate) / 10000;
+
+        if (totalNormalizedYield == 0) return 0;
+
+        // Apply discount
+        uint256 claimerPayment = totalNormalizedYield * (10000 - discountRate) / 10000;
+
+        // Denormalize to reward token decimals
+        return _denormalizeAmount(claimerPayment, rewardToken);
     }
 
     /*//////////////////////////////////////////////////////////////

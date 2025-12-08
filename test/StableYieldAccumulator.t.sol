@@ -21,11 +21,19 @@ contract MockERC20 is ERC20 {
 
 /**
  * @title MockYieldStrategy
- * @notice Mock yield strategy for testing getYield and getTotalYield
+ * @notice Mock yield strategy for testing full claim flow
+ * @dev Simulates a yield strategy that holds tokens and can withdraw to recipients
  */
 contract MockYieldStrategy is IYieldStrategy {
     mapping(address => mapping(address => uint256)) public principals;
     mapping(address => mapping(address => uint256)) public yields;
+
+    // Track withdrawFrom calls for testing
+    uint256 public withdrawFromCallCount;
+    address public lastWithdrawToken;
+    address public lastWithdrawClient;
+    uint256 public lastWithdrawAmount;
+    address public lastWithdrawRecipient;
 
     function setBalances(address token, address account, uint256 principal, uint256 yieldAmount) external {
         principals[token][account] = principal;
@@ -50,7 +58,38 @@ contract MockYieldStrategy is IYieldStrategy {
     function setClient(address, bool) external pure override {}
     function emergencyWithdraw(uint256) external pure override {}
     function totalWithdrawal(address, address) external pure override {}
-    function withdrawFrom(address, address, uint256, address) external pure override {}
+
+    /**
+     * @notice Mock withdrawFrom that transfers tokens to recipient
+     * @dev Actually transfers ERC20 tokens from this contract to recipient
+     */
+    function withdrawFrom(
+        address token,
+        address client,
+        uint256 amount,
+        address recipient
+    ) external override {
+        withdrawFromCallCount++;
+        lastWithdrawToken = token;
+        lastWithdrawClient = client;
+        lastWithdrawAmount = amount;
+        lastWithdrawRecipient = recipient;
+
+        // Actually transfer tokens from this contract to recipient
+        // The strategy must hold the tokens for this to work
+        IERC20(token).transfer(recipient, amount);
+
+        // Reduce yield after withdrawal
+        yields[token][client] -= amount;
+    }
+
+    function resetWithdrawTracking() external {
+        withdrawFromCallCount = 0;
+        lastWithdrawToken = address(0);
+        lastWithdrawClient = address(0);
+        lastWithdrawAmount = 0;
+        lastWithdrawRecipient = address(0);
+    }
 }
 
 /**
@@ -500,101 +539,253 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                        CLAIM MECHANISM - ACTUAL TOKEN TRANSFERS
+                        CLAIM MECHANISM - FULL FLOW TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_claim_TransfersTokensToPhlimbo() public {
-        // Setup: Configure accumulator with rewardToken, phlimbo
+    /**
+     * @notice Helper to set up a complete claim scenario
+     * @dev Sets up strategies with yield, claimer with reward tokens, and all configs
+     */
+    function _setupClaimScenario(uint256 yieldAmount) internal returns (address claimer) {
+        claimer = makeAddr("claimer");
+
+        // Setup accumulator config
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200); // 2% discount
 
-        // Mint reward tokens to the accumulator contract
-        uint256 claimAmount = 100e18;
-        rewardToken.mint(address(accumulator), claimAmount);
+        // Add strategy with token
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
-        // Record balances before claim
-        uint256 accumulatorBalanceBefore = rewardToken.balanceOf(address(accumulator));
-        uint256 phlimboBalanceBefore = rewardToken.balanceOf(phlimboAddr);
+        // Set token config for strategy token (18 decimals, 1:1 rate)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        // Set token config for reward token (18 decimals, 1:1 rate)
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
-        // Claim
-        vm.expectEmit(true, false, false, true);
-        emit RewardsClaimed(address(this), claimAmount, 0);
-        accumulator.claim(claimAmount);
+        // Set up mock strategy with yield
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
 
-        // Verify actual token transfer occurred
-        uint256 accumulatorBalanceAfter = rewardToken.balanceOf(address(accumulator));
-        uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
+        // Fund the strategy with yield tokens so it can transfer them
+        strategyToken1.mint(address(mockStrategy1), yieldAmount);
 
-        assertEq(accumulatorBalanceBefore - accumulatorBalanceAfter, claimAmount, "Accumulator should have transferred tokens");
-        assertEq(phlimboBalanceAfter - phlimboBalanceBefore, claimAmount, "Phlimbo should have received tokens");
+        // Fund claimer with reward tokens (need to pay discounted amount)
+        // With 2% discount on yieldAmount, claimer pays: yieldAmount * 0.98
+        uint256 claimerPayment = yieldAmount * 98 / 100;
+        rewardToken.mint(claimer, claimerPayment + 1e18); // Add buffer
+
+        // Claimer approves accumulator to spend reward tokens
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
     }
 
-    function test_claim_EmitsEvent() public {
+    function test_claim_FullFlow_TransfersCorrectly() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        // Expected payment: 100e18 * 0.98 = 98e18
+        uint256 expectedPayment = yieldAmount * 98 / 100;
+
+        // Record balances before
+        uint256 claimerRewardBefore = rewardToken.balanceOf(claimer);
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+        uint256 phlimboRewardBefore = rewardToken.balanceOf(phlimboAddr);
+
+        // Claim
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Record balances after
+        uint256 claimerRewardAfter = rewardToken.balanceOf(claimer);
+        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
+        uint256 phlimboRewardAfter = rewardToken.balanceOf(phlimboAddr);
+
+        // Verify: Claimer paid reward tokens to phlimbo
+        assertEq(claimerRewardBefore - claimerRewardAfter, expectedPayment, "Claimer should have paid discounted amount");
+        assertEq(phlimboRewardAfter - phlimboRewardBefore, expectedPayment, "Phlimbo should have received payment");
+
+        // Verify: Claimer received yield tokens from strategy
+        assertEq(claimerYieldAfter - claimerYieldBefore, yieldAmount, "Claimer should have received yield tokens");
+    }
+
+    function test_claim_CallsWithdrawFromOnStrategy() public {
+        uint256 yieldAmount = 50e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Verify withdrawFrom was called with correct parameters
+        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "withdrawFrom should be called once");
+        assertEq(mockStrategy1.lastWithdrawToken(), address(strategyToken1), "Should withdraw correct token");
+        assertEq(mockStrategy1.lastWithdrawClient(), minterAddr, "Should withdraw from minter");
+        assertEq(mockStrategy1.lastWithdrawAmount(), yieldAmount, "Should withdraw full yield");
+        assertEq(mockStrategy1.lastWithdrawRecipient(), claimer, "Should send to claimer");
+    }
+
+    function test_claim_MultipleStrategies() public {
+        address claimer = makeAddr("claimer");
+
+        // Setup both strategies
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        rewardToken.mint(address(accumulator), 100e18);
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200);
 
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
+
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        // Set yields: 60e18 from strategy1, 40e18 from strategy2 = 100e18 total
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
+        mockStrategy2.setBalances(address(strategyToken2), minterAddr, 500e18, 40e18);
+
+        // Fund strategies with yield tokens
+        strategyToken1.mint(address(mockStrategy1), 60e18);
+        strategyToken2.mint(address(mockStrategy2), 40e18);
+
+        // Fund claimer: 100e18 total * 0.98 = 98e18 payment
+        rewardToken.mint(claimer, 100e18);
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        // Claim
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Verify claimer received both yield tokens
+        assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
+        assertEq(strategyToken2.balanceOf(claimer), 40e18, "Should receive yield from strategy2");
+
+        // Verify both strategies had withdrawFrom called
+        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "Strategy1 withdrawFrom called");
+        assertEq(mockStrategy2.withdrawFromCallCount(), 1, "Strategy2 withdrawFrom called");
+    }
+
+    function test_claim_EmitsEvents() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+        uint256 expectedPayment = yieldAmount * 98 / 100;
+
+        vm.prank(claimer);
+
+        // Expect RewardsCollected for each strategy with yield
         vm.expectEmit(true, false, false, true);
-        emit RewardsClaimed(address(this), 100e18, 0);
-        accumulator.claim(100e18);
+        emit RewardsCollected(address(mockStrategy1), yieldAmount);
+
+        // Expect RewardsClaimed at the end
+        vm.expectEmit(true, false, false, true);
+        emit RewardsClaimed(claimer, expectedPayment, 1);
+
+        accumulator.claim();
     }
 
     function test_claim_RevertIf_Paused() public {
-        accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setRewardToken(address(rewardToken));
-        rewardToken.mint(address(accumulator), 100e18);
+        address claimer = _setupClaimScenario(100e18);
 
         accumulator.setPauser(pauser);
         vm.prank(pauser);
         accumulator.pause();
 
+        vm.prank(claimer);
         vm.expectRevert();
-        accumulator.claim(100e18);
+        accumulator.claim();
     }
 
-    function test_claim_RevertIf_ZeroAmount() public {
+    function test_claim_RevertIf_NoYield() public {
+        address claimer = makeAddr("claimer");
+
+        // Setup without any yield
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
 
+        // No yield set
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 0);
+
+        vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
-        accumulator.claim(0);
+        accumulator.claim();
     }
 
     function test_claim_RevertIf_PhlimboNotSet() public {
         accumulator.setRewardToken(address(rewardToken));
-        rewardToken.mint(address(accumulator), 100e18);
+        accumulator.setMinter(minterAddr);
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim(100e18);
+        accumulator.claim();
     }
 
     function test_claim_RevertIf_RewardTokenNotSet() public {
         accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setMinter(minterAddr);
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim(100e18);
+        accumulator.claim();
     }
 
-    function test_claim_RevertIf_InsufficientBalance() public {
+    function test_claim_RevertIf_MinterNotSet() public {
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        // Don't mint any tokens
 
-        vm.expectRevert(IStableYieldAccumulator.InsufficientPending.selector);
-        accumulator.claim(100e18);
+        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
+        accumulator.claim();
     }
 
-    function test_calculateClaimAmount_ReturnsCorrectAmount() public {
-        accumulator.setDiscountRate(200); // 2% discount
+    function test_claim_RevertIf_TokenPaused() public {
+        address claimer = _setupClaimScenario(100e18);
 
-        uint256 claimAmount = accumulator.calculateClaimAmount(100e18);
-        // With 2% discount: 100 * (10000 - 200) / 10000 = 98
-        assertEq(claimAmount, 98e18, "Should return 98e18 with 2% discount");
+        // Pause the strategy token
+        accumulator.pauseToken(address(strategyToken1));
+
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.TokenIsPaused.selector);
+        accumulator.claim();
+    }
+
+    function test_calculateClaimAmount_ReturnsDiscountedPayment() public {
+        address claimer = _setupClaimScenario(100e18);
+
+        // calculateClaimAmount should return what claimer would pay
+        // Total yield: 100e18, discount: 2%, payment: 98e18
+        uint256 expectedPayment = accumulator.calculateClaimAmount();
+        assertEq(expectedPayment, 98e18, "Should return discounted payment amount");
     }
 
     function test_calculateClaimAmount_NoDiscount() public {
-        uint256 claimAmount = accumulator.calculateClaimAmount(100e18);
-        assertEq(claimAmount, 100e18, "Should return same amount with no discount");
+        address claimer = makeAddr("claimer");
+
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(0); // No discount
+
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 100e18);
+
+        // No discount: payment = total yield
+        uint256 expectedPayment = accumulator.calculateClaimAmount();
+        assertEq(expectedPayment, 100e18, "Should return full amount with no discount");
+    }
+
+    function test_calculateClaimAmount_ZeroIfNoStrategies() public {
+        accumulator.setMinter(minterAddr);
+
+        uint256 payment = accumulator.calculateClaimAmount();
+        assertEq(payment, 0, "Should return 0 if no strategies");
+    }
+
+    function test_calculateClaimAmount_ZeroIfMinterNotSet() public {
+        uint256 payment = accumulator.calculateClaimAmount();
+        assertEq(payment, 0, "Should return 0 if minter not set");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -711,31 +902,49 @@ contract StableYieldAccumulatorTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_fullFlow_AddStrategySetConfigCollectClaim() public {
+        address claimer = makeAddr("claimer");
+
         // 1. Add strategy with token
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
-        // 2. Set token config
-        accumulator.setTokenConfig(address(strategyToken1), 6, 1e18);
+        // 2. Set token config (18 decimals for easy testing)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         // 3. Set discount rate
         accumulator.setDiscountRate(200);
 
-        // 4. Set phlimbo
+        // 4. Set phlimbo and minter
         accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setMinter(minterAddr);
 
-        // 5. Set reward token and fund the contract
+        // 5. Set reward token
         accumulator.setRewardToken(address(rewardToken));
-        rewardToken.mint(address(accumulator), 100e18);
 
-        // 6. Claim and verify actual token transfer
+        // 6. Setup yield: 100e18 yield in strategy
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 100e18);
+        strategyToken1.mint(address(mockStrategy1), 100e18);
+
+        // 7. Fund claimer with reward tokens (98e18 needed for 2% discount)
+        rewardToken.mint(claimer, 100e18);
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        // 8. Claim and verify actual token transfers
         uint256 phlimboBalanceBefore = rewardToken.balanceOf(phlimboAddr);
-        accumulator.claim(100e18);
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+
+        vm.prank(claimer);
+        accumulator.claim();
+
         uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
+        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
 
         // Verify state
         assertEq(accumulator.getYieldStrategies().length, 1, "Should have 1 strategy");
         assertEq(accumulator.getDiscountRate(), 200, "Should have discount rate of 200");
-        assertEq(phlimboBalanceAfter - phlimboBalanceBefore, 100e18, "Phlimbo should have received tokens");
+        assertEq(phlimboBalanceAfter - phlimboBalanceBefore, 98e18, "Phlimbo should have received discounted payment");
+        assertEq(claimerYieldAfter - claimerYieldBefore, 100e18, "Claimer should have received yield tokens");
     }
 
     function test_multipleStrategies_GetTotalYield() public {
@@ -756,17 +965,17 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_pauseUnpause_AffectsClaimOnly() public {
-        accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setRewardToken(address(rewardToken));
-        rewardToken.mint(address(accumulator), 200e18);
+        // Setup complete claim scenario
+        address claimer = _setupClaimScenario(100e18);
 
         accumulator.setPauser(pauser);
         vm.prank(pauser);
         accumulator.pause();
 
         // Claim should revert due to pause
+        vm.prank(claimer);
         vm.expectRevert();
-        accumulator.claim(100e18);
+        accumulator.claim();
 
         // Unpause
         vm.prank(pauser);
@@ -774,10 +983,16 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim should now work and transfer actual tokens
         uint256 phlimboBalanceBefore = rewardToken.balanceOf(phlimboAddr);
-        accumulator.claim(100e18);
-        uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
-        assertEq(phlimboBalanceAfter - phlimboBalanceBefore, 100e18, "Should transfer tokens after unpause");
+        vm.prank(claimer);
+        accumulator.claim();
+
+        uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
+        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
+
+        assertEq(phlimboBalanceAfter - phlimboBalanceBefore, 98e18, "Phlimbo should receive discounted payment");
+        assertEq(claimerYieldAfter - claimerYieldBefore, 100e18, "Claimer should receive yield tokens");
     }
 
     /*//////////////////////////////////////////////////////////////

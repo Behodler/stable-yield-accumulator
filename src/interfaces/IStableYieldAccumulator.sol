@@ -244,17 +244,21 @@ interface IStableYieldAccumulator {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Claims pending yield from all strategies by paying with reward token
-     * @param amount Amount of reward token to pay
+     * @notice Claims all pending yield from all strategies by paying with reward token
+     * @dev Full flow:
+     *      1. Calculate total pending yield (normalized)
+     *      2. Apply discount to get claimer payment
+     *      3. TransferFrom claimer to phlimbo
+     *      4. WithdrawFrom each strategy to claimer
      */
-    function claim(uint256 amount) external;
+    function claim() external;
 
     /**
-     * @notice Calculates how much can be claimed for a given input amount
-     * @param inputAmount Amount of reward token to pay
-     * @return Amount that can be claimed
+     * @notice Calculates how much the claimer would pay for total pending yield
+     * @dev Returns the discounted amount in reward token decimals
+     * @return Amount of reward token claimer would pay
      */
-    function calculateClaimAmount(uint256 inputAmount)
+    function calculateClaimAmount()
         external
         view
         returns (uint256);
