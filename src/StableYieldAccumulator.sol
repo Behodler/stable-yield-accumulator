@@ -298,6 +298,7 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
      */
     function claim(address token, uint256 amount) external override whenNotPaused {
         revert NotImplemented();
+        //TODO: remove token parameter. This is set by owner and simply deducted from holder.
     }
 
     /**
@@ -347,5 +348,6 @@ contract StableYieldAccumulator is Ownable, Pausable, IPausable, IStableYieldAcc
      */
     function updatePrincipal(address strategy, uint256 amount) internal {
         // Stub - will be implemented in green phase
+        //REVIEWER: what is this function? It seems incorrect
     }
 }
