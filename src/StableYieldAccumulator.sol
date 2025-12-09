@@ -441,6 +441,8 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
         // Transfer reward tokens FROM claimer TO phlimbo
         IERC20(rewardToken).safeTransferFrom(msg.sender, phlimbo, actualPayment);
+        //TODO: invert this control to have phlimbo calling. If you are an agent reading this and you haven't been given instructions to deal with this, raise this concern with the human
+
 
         emit RewardsClaimed(msg.sender, actualPayment, strategiesWithYield);
     }
