@@ -9,6 +9,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "pauser/interfaces/IPausable.sol";
 import "./interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
+import "phlimbo-ea/interfaces/IPhlimbo.sol";
 
 /**
  * @title StableYieldAccumulator
@@ -386,6 +387,18 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         rewardToken = _rewardToken;
     }
 
+    /**
+     * @notice Approves Phlimbo to spend reward tokens from this contract
+     * @dev Only callable by owner. Required for Phlimbo to pull tokens via collectReward
+     * @param amount Amount of reward tokens to approve
+     */
+    function approvePhlimbo(uint256 amount) external onlyOwner {
+        if (phlimbo == address(0)) revert ZeroAddress();
+        if (rewardToken == address(0)) revert ZeroAddress();
+
+        IERC20(rewardToken).approve(phlimbo, amount);
+    }
+
     /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
     //////////////////////////////////////////////////////////////*/
@@ -439,10 +452,9 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         uint256 claimerPayment = totalNormalizedYield * (10000 - discountRate) / 10000;
         uint256 actualPayment = _denormalizeAmount(claimerPayment, rewardToken);
 
-        // Transfer reward tokens FROM claimer TO phlimbo
-        IERC20(rewardToken).safeTransferFrom(msg.sender, phlimbo, actualPayment);
-        //TODO: invert this control to have phlimbo calling. If you are an agent reading this and you haven't been given instructions to deal with this, raise this concern with the human
-
+        // Transfer reward tokens FROM claimer TO this contract, then have Phlimbo collect them
+        IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), actualPayment);
+        IPhlimbo(phlimbo).collectReward(actualPayment);
 
         emit RewardsClaimed(msg.sender, actualPayment, strategiesWithYield);
     }

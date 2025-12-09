@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "../src/StableYieldAccumulator.sol";
 import "../src/interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
+import "phlimbo-ea/interfaces/IPhlimbo.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 /**
@@ -16,6 +17,45 @@ contract MockERC20 is ERC20 {
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
+    }
+}
+
+/**
+ * @title MockPhlimbo
+ * @notice Mock Phlimbo contract for testing collectReward functionality
+ * @dev Simulates Phlimbo's collectReward behavior by pulling tokens from the accumulator
+ */
+contract MockPhlimbo {
+    address public rewardToken;
+    address public yieldAccumulator;
+    uint256 public lastCollectedAmount;
+    uint256 public collectRewardCallCount;
+
+    constructor(address _rewardToken) {
+        rewardToken = _rewardToken;
+    }
+
+    function setYieldAccumulator(address _yieldAccumulator) external {
+        yieldAccumulator = _yieldAccumulator;
+    }
+
+    /**
+     * @notice Mock collectReward that pulls tokens from yield accumulator
+     * @dev This simulates the real Phlimbo behavior where it pulls tokens
+     */
+    function collectReward(uint256 amount) external {
+        require(msg.sender == yieldAccumulator, "Only yield accumulator can call");
+
+        collectRewardCallCount++;
+        lastCollectedAmount = amount;
+
+        // Pull tokens from the yield accumulator
+        IERC20(rewardToken).transferFrom(msg.sender, address(this), amount);
+    }
+
+    function resetTracking() external {
+        collectRewardCallCount = 0;
+        lastCollectedAmount = 0;
     }
 }
 
@@ -104,6 +144,7 @@ contract StableYieldAccumulatorTest is Test {
     MockERC20 public strategyToken2;
     MockYieldStrategy public mockStrategy1;
     MockYieldStrategy public mockStrategy2;
+    MockPhlimbo public mockPhlimbo;
 
     address public owner;
     address public pauser;
@@ -136,7 +177,6 @@ contract StableYieldAccumulatorTest is Test {
         pauser = makeAddr("pauser");
         user1 = makeAddr("user1");
         user2 = makeAddr("user2");
-        phlimboAddr = makeAddr("phlimbo");
         minterAddr = makeAddr("minter");
 
         // Deploy mock tokens
@@ -148,7 +188,13 @@ contract StableYieldAccumulatorTest is Test {
         mockStrategy1 = new MockYieldStrategy();
         mockStrategy2 = new MockYieldStrategy();
 
+        // Deploy accumulator
         accumulator = new StableYieldAccumulator();
+
+        // Deploy mock Phlimbo and set it up
+        mockPhlimbo = new MockPhlimbo(address(rewardToken));
+        mockPhlimbo.setYieldAccumulator(address(accumulator));
+        phlimboAddr = address(mockPhlimbo);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -577,6 +623,9 @@ contract StableYieldAccumulatorTest is Test {
         // Claimer approves accumulator to spend reward tokens
         vm.prank(claimer);
         rewardToken.approve(address(accumulator), type(uint256).max);
+
+        // Approve Phlimbo to pull tokens from accumulator
+        accumulator.approvePhlimbo(type(uint256).max);
     }
 
     function test_claim_FullFlow_TransfersCorrectly() public {
@@ -651,6 +700,9 @@ contract StableYieldAccumulatorTest is Test {
         rewardToken.mint(claimer, 100e18);
         vm.prank(claimer);
         rewardToken.approve(address(accumulator), type(uint256).max);
+
+        // Approve Phlimbo to pull tokens from accumulator
+        accumulator.approvePhlimbo(type(uint256).max);
 
         // Claim
         vm.prank(claimer);
@@ -929,6 +981,9 @@ contract StableYieldAccumulatorTest is Test {
         rewardToken.mint(claimer, 100e18);
         vm.prank(claimer);
         rewardToken.approve(address(accumulator), type(uint256).max);
+
+        // 7.5. Approve Phlimbo to pull tokens from accumulator
+        accumulator.approvePhlimbo(type(uint256).max);
 
         // 8. Claim and verify actual token transfers
         uint256 phlimboBalanceBefore = rewardToken.balanceOf(phlimboAddr);
