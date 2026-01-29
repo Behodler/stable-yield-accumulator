@@ -477,6 +477,21 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /**
+     * @notice Internal helper to get normalized yield for a specific strategy
+     * @dev Calls _getYieldForStrategy and normalizes the result to 18 decimals
+     * @param strategy Address of the yield strategy
+     * @param token Address of the strategy's underlying token
+     * @return Yield amount normalized to 18 decimals
+     */
+    function _getNormalizedYieldForStrategy(address strategy, address token) internal view returns (uint256) {
+        uint256 yield = _getYieldForStrategy(strategy, token);
+        if (yield > 0) {
+            return _normalizeAmount(yield, token);
+        }
+        return 0;
+    }
+
+    /**
      * @notice Normalizes an amount from token decimals to 18 decimals
      * @param amount The amount in token decimals
      * @param token The token address to get decimals from
@@ -607,8 +622,10 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Gets the total pending yield across all strategies
-     * @dev Sums getYield() across all registered strategies
-     * @return Total pending yield amount
+     * @dev Returns yield normalized to 18 decimals for cross-token comparison.
+     *      Uses _getNormalizedYieldForStrategy() to properly normalize yields from
+     *      tokens with different decimal places (e.g., 6-decimal USDC, 18-decimal DOLA).
+     * @return Total pending yield normalized to 18 decimals
      */
     function getTotalYield() external view override returns (uint256) {
         if (minterAddress == address(0)) return 0;
@@ -619,14 +636,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             address token = strategyTokens[strategy];
             if (token == address(0)) continue;
 
-            // Query each strategy for minter's yield
-            IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
-            uint256 totalBalance = yieldStrategy.totalBalanceOf(token, minterAddress);
-            uint256 principal = yieldStrategy.principalOf(token, minterAddress);
-
-            if (totalBalance > principal) {
-                total += totalBalance - principal;
-            }
+            total += _getNormalizedYieldForStrategy(strategy, token);
         }
         return total;
     }

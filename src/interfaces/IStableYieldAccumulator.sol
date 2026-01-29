@@ -269,14 +269,16 @@ interface IStableYieldAccumulator {
 
     /**
      * @notice Gets the pending yield for a specific strategy
+     * @dev Returns yield in the strategy's native token decimals (NOT normalized)
      * @param strategy Address of the yield strategy
-     * @return Amount of pending yield
+     * @return Pending yield amount in native token decimals
      */
     function getYield(address strategy) external view returns (uint256);
 
     /**
      * @notice Gets the total pending yield across all strategies
-     * @return Total amount of pending yield
+     * @dev Returns yield normalized to 18 decimals for cross-token comparison
+     * @return Total pending yield normalized to 18 decimals
      */
     function getTotalYield() external view returns (uint256);
 }
