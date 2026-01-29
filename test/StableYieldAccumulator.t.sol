@@ -21,6 +21,26 @@ contract MockERC20 is ERC20 {
 }
 
 /**
+ * @title MockERC20WithDecimals
+ * @notice ERC20 mock with configurable decimals for testing multi-decimal scenarios
+ */
+contract MockERC20WithDecimals is ERC20 {
+    uint8 private _decimals;
+
+    constructor(string memory name, string memory symbol, uint8 decimals_) ERC20(name, symbol) {
+        _decimals = decimals_;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return _decimals;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+/**
  * @title MockPhlimbo
  * @notice Mock Phlimbo contract for testing collectReward functionality
  * @dev Simulates Phlimbo's collectReward behavior by pulling tokens from the accumulator
@@ -1154,5 +1174,76 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setPhlimbo(phlimboAddr2);
 
         assertEq(accumulator.phlimbo(), phlimboAddr2, "Should update to second phlimbo");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                MULTI-DECIMAL NORMALIZATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Tests that getTotalYield() properly normalizes yields from tokens with different decimals
+     * @dev This test verifies the fix for the bug where getTotalYield() summed raw token amounts
+     *      without normalizing them to a common 18-decimal base.
+     *
+     *      Scenario:
+     *      - Strategy 1: 6-decimal token (like USDC) with 300 USDC yield (300e6 raw)
+     *      - Strategy 2: 18-decimal token (like DOLA) with 4000 DOLA yield (4000e18 raw)
+     *
+     *      Bug behavior (before fix):
+     *      - Returns 300e6 + 4000e18 = ~4000e18 (treating 300e6 as negligible)
+     *
+     *      Correct behavior (after fix):
+     *      - Normalizes 300e6 to 300e18 (scales up by 10^12)
+     *      - Returns 300e18 + 4000e18 = 4300e18
+     */
+    function test_getTotalYield_NormalizesMultiDecimalTokens() public {
+        // Create 6-decimal token (like USDC)
+        MockERC20WithDecimals usdcLike = new MockERC20WithDecimals("USDC Mock", "USDC", 6);
+
+        // Create 18-decimal token (like DOLA)
+        MockERC20WithDecimals dolaLike = new MockERC20WithDecimals("DOLA Mock", "DOLA", 18);
+
+        // Create mock strategies for each token
+        MockYieldStrategy usdcStrategy = new MockYieldStrategy();
+        MockYieldStrategy dolaStrategy = new MockYieldStrategy();
+
+        // Setup accumulator
+        accumulator.setMinter(minterAddr);
+
+        // Add strategies
+        accumulator.addYieldStrategy(address(usdcStrategy), address(usdcLike));
+        accumulator.addYieldStrategy(address(dolaStrategy), address(dolaLike));
+
+        // Configure token decimals and exchange rates (1:1)
+        accumulator.setTokenConfig(address(usdcLike), 6, 1e18);  // 6 decimals
+        accumulator.setTokenConfig(address(dolaLike), 18, 1e18); // 18 decimals
+
+        // Set yields:
+        // - USDC strategy: 300 USDC yield (in 6 decimals = 300e6)
+        // - DOLA strategy: 4000 DOLA yield (in 18 decimals = 4000e18)
+        uint256 usdcYield = 300e6;   // 300 USDC in native decimals
+        uint256 dolaYield = 4000e18; // 4000 DOLA in native decimals
+
+        usdcStrategy.setBalances(address(usdcLike), minterAddr, 1000e6, usdcYield);
+        dolaStrategy.setBalances(address(dolaLike), minterAddr, 10000e18, dolaYield);
+
+        // Get total yield - should be normalized to 18 decimals
+        uint256 totalYield = accumulator.getTotalYield();
+
+        // Expected: 300e18 (normalized USDC) + 4000e18 (DOLA) = 4300e18
+        uint256 expectedNormalizedTotal = 4300e18;
+
+        assertEq(
+            totalYield,
+            expectedNormalizedTotal,
+            "getTotalYield should return normalized sum of 4300e18"
+        );
+
+        // Also verify individual getYield() returns native decimals (NOT normalized)
+        uint256 individualUsdcYield = accumulator.getYield(address(usdcStrategy));
+        uint256 individualDolaYield = accumulator.getYield(address(dolaStrategy));
+
+        assertEq(individualUsdcYield, usdcYield, "getYield for USDC strategy should return native 6-decimal value");
+        assertEq(individualDolaYield, dolaYield, "getYield for DOLA strategy should return native 18-decimal value");
     }
 }
