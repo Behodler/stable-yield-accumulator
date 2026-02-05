@@ -6,10 +6,15 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import "pauser/interfaces/IPausable.sol";
 import "./interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
 import "phlimbo-ea/interfaces/IPhlimbo.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {FullMath} from "v4-core/libraries/FullMath.sol";
 
 /**
  * @title StableYieldAccumulator
@@ -53,6 +58,7 @@ import "phlimbo-ea/interfaces/IPhlimbo.sol";
  */
 contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable, IStableYieldAccumulator {
     using SafeERC20 for IERC20;
+    using StateLibrary for IPoolManager;
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -115,6 +121,42 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     mapping(address => address) public strategyTokens;
 
     /*//////////////////////////////////////////////////////////////
+                    CONDITIONAL CLAIM STATE VARIABLES
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Uniswap V4 PoolManager for price queries
+     * @dev Used to get sqrtPriceX96 from the phUSD/sUSDS pool
+     */
+    IPoolManager public poolManager;
+
+    /**
+     * @notice Pool identifier for the phUSD/sUSDS price pool
+     * @dev Used to query the spot price from the Uniswap V4 pool
+     */
+    PoolId public pricePoolId;
+
+    /**
+     * @notice sUSDS vault token for converting sUSDS to USDS value
+     * @dev Used to call convertToAssets() to get the USDS equivalent
+     */
+    IERC4626 public sUSDS;
+
+    /**
+     * @notice Target price threshold for conditional claims
+     * @dev Price is expressed in USDS terms with 18 decimal precision
+     *      Claims are only allowed when phUSD price >= targetPrice
+     */
+    uint256 public targetPrice;
+
+    /**
+     * @notice Indicates token ordering in the Uniswap V4 pool
+     * @dev True if phUSD is currency0 (lower address), false if currency1
+     *      Required for correct price interpretation from sqrtPriceX96
+     */
+    bool public token0IsPhUSD;
+
+    /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
@@ -131,6 +173,34 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @param newMinter New minter address
      */
     event MinterUpdated(address indexed oldMinter, address indexed newMinter);
+
+    /**
+     * @notice Emitted when the pool manager address is updated
+     * @param oldPoolManager Previous pool manager address
+     * @param newPoolManager New pool manager address
+     */
+    event PoolManagerUpdated(address indexed oldPoolManager, address indexed newPoolManager);
+
+    /**
+     * @notice Emitted when the price pool configuration is updated
+     * @param poolId The new pool identifier
+     * @param token0IsPhUSD Whether phUSD is token0 in the pool
+     */
+    event PricePoolUpdated(PoolId indexed poolId, bool token0IsPhUSD);
+
+    /**
+     * @notice Emitted when the sUSDS address is updated
+     * @param oldSUSDS Previous sUSDS address
+     * @param newSUSDS New sUSDS address
+     */
+    event SUSDSUpdated(address indexed oldSUSDS, address indexed newSUSDS);
+
+    /**
+     * @notice Emitted when the target price is updated
+     * @param oldTargetPrice Previous target price
+     * @param newTargetPrice New target price
+     */
+    event TargetPriceUpdated(uint256 oldTargetPrice, uint256 newTargetPrice);
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -400,6 +470,56 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /*//////////////////////////////////////////////////////////////
+                    CONDITIONAL CLAIM CONFIGURATION
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Sets the Uniswap V4 PoolManager for price queries
+     * @dev Used to query sqrtPriceX96 from the phUSD/sUSDS pool
+     * @param _poolManager Address of the Uniswap V4 PoolManager contract
+     */
+    function setPoolManager(address _poolManager) external onlyOwner {
+        address oldPoolManager = address(poolManager);
+        poolManager = IPoolManager(_poolManager);
+        emit PoolManagerUpdated(oldPoolManager, _poolManager);
+    }
+
+    /**
+     * @notice Sets the price pool configuration for conditional claims
+     * @dev Configures which Uniswap V4 pool to use for price queries
+     * @param _poolId The PoolId of the phUSD/sUSDS pool
+     * @param _token0IsPhUSD True if phUSD is currency0 in the pool
+     */
+    function setPricePool(PoolId _poolId, bool _token0IsPhUSD) external onlyOwner {
+        pricePoolId = _poolId;
+        token0IsPhUSD = _token0IsPhUSD;
+        emit PricePoolUpdated(_poolId, _token0IsPhUSD);
+    }
+
+    /**
+     * @notice Sets the sUSDS vault token address
+     * @dev Used for converting sUSDS amounts to USDS value
+     * @param _sUSDS Address of the sUSDS ERC4626 vault
+     */
+    function setSUSDS(address _sUSDS) external onlyOwner {
+        address oldSUSDS = address(sUSDS);
+        sUSDS = IERC4626(_sUSDS);
+        emit SUSDSUpdated(oldSUSDS, _sUSDS);
+    }
+
+    /**
+     * @notice Sets the target price threshold for conditional claims
+     * @dev Claims are only allowed when phUSD price in USDS >= targetPrice
+     *      Set to 0 to disable the price check
+     * @param _targetPrice Target price in USDS terms (18 decimal precision)
+     */
+    function setTargetPrice(uint256 _targetPrice) external onlyOwner {
+        uint256 oldTargetPrice = targetPrice;
+        targetPrice = _targetPrice;
+        emit TargetPriceUpdated(oldTargetPrice, _targetPrice);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
     //////////////////////////////////////////////////////////////*/
 
@@ -421,6 +541,13 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
         if (minterAddress == address(0)) revert ZeroAddress();
+
+        // Conditional price check: only allow claim if phUSD price >= target
+        // Skip check if poolManager is not set or targetPrice is 0 (graceful degradation)
+        if (address(poolManager) != address(0) && targetPrice > 0) {
+            uint256 currentPrice = _getPhUSDPriceInUSDS();
+            if (currentPrice < targetPrice) revert PriceBelowTarget();
+        }
 
         uint256 totalNormalizedYield = 0;
         uint256 strategiesWithYield = 0;
@@ -555,6 +682,78 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /**
+     * @notice Calculates the phUSD price in USDS terms from the Uniswap V4 pool
+     * @dev Price calculation:
+     *      1. Get sqrtPriceX96 from PoolManager.getSlot0(pricePoolId)
+     *      2. Calculate raw price: (sqrtPriceX96 / 2^96)^2
+     *      3. Interpret based on token0IsPhUSD flag
+     *      4. Convert sUSDS to USDS using sUSDS.convertToAssets()
+     *
+     * Price interpretation:
+     * - sqrtPriceX96 represents sqrt(token1/token0) * 2^96
+     * - If token0IsPhUSD: price = token1/token0 = sUSDS/phUSD
+     *   - phUSD price in sUSDS = (sqrtPriceX96)^2 / 2^192
+     *   - phUSD price in USDS = (sUSDS amount * convertToAssets(1e18)) / 1e18
+     * - If token1IsPhUSD: price = 1 / (token1/token0) = phUSD/sUSDS
+     *   - sUSDS price in phUSD = (sqrtPriceX96)^2 / 2^192
+     *   - phUSD price in sUSDS = 2^192 / (sqrtPriceX96)^2
+     *
+     * @return price The phUSD price in USDS terms with 18 decimal precision
+     */
+    function _getPhUSDPriceInUSDS() internal view returns (uint256) {
+        // Get slot0 from the price pool
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(pricePoolId);
+
+        // Calculate price from sqrtPriceX96
+        // sqrtPriceX96 = sqrt(price) * 2^96
+        // price = (sqrtPriceX96 / 2^96)^2 = (sqrtPriceX96)^2 / 2^192
+        //
+        // Using FullMath to handle potential overflow:
+        // price = sqrtPriceX96 * sqrtPriceX96 / 2^192
+        //
+        // For 18 decimal precision, we need:
+        // price_18decimals = sqrtPriceX96 * sqrtPriceX96 * 1e18 / 2^192
+
+        uint256 priceInSUSDS;
+
+        if (token0IsPhUSD) {
+            // token0 = phUSD, token1 = sUSDS
+            // sqrtPriceX96 represents sqrt(sUSDS/phUSD) * 2^96
+            // price = sUSDS per phUSD = (sqrtPriceX96)^2 / 2^192
+            // price_18decimals = sqrtPriceX96^2 * 1e18 / 2^192
+
+            // We need phUSD price IN sUSDS terms (how many sUSDS per phUSD)
+            priceInSUSDS = FullMath.mulDiv(
+                uint256(sqrtPriceX96) * uint256(sqrtPriceX96),
+                1e18,
+                1 << 192
+            );
+        } else {
+            // token0 = sUSDS, token1 = phUSD
+            // sqrtPriceX96 represents sqrt(phUSD/sUSDS) * 2^96
+            // price = phUSD per sUSDS = (sqrtPriceX96)^2 / 2^192
+            // phUSD price in sUSDS = 1 / price = 2^192 / (sqrtPriceX96)^2
+            // price_18decimals = 1e18 * 2^192 / sqrtPriceX96^2
+
+            priceInSUSDS = FullMath.mulDiv(
+                1e18,
+                1 << 192,
+                uint256(sqrtPriceX96) * uint256(sqrtPriceX96)
+            );
+        }
+
+        // Convert sUSDS to USDS using the sUSDS vault's conversion rate
+        // priceInSUSDS is "how many sUSDS per 1 phUSD" with 18 decimals
+        // convertToAssets(priceInSUSDS) gives us "how many USDS that amount of sUSDS is worth"
+        if (address(sUSDS) != address(0)) {
+            return sUSDS.convertToAssets(priceInSUSDS);
+        }
+
+        // If sUSDS not configured, return price in sUSDS (assume 1:1)
+        return priceInSUSDS;
+    }
+
+    /**
      * @notice Calculates how much the claimer would pay for total pending yield
      * @dev Returns the discounted amount in reward token that claimer would pay
      * @return paymentAmount Amount of reward token claimer would pay (in reward token decimals)
@@ -588,6 +787,43 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
         // Denormalize to reward token decimals
         return _denormalizeAmount(claimerPayment, rewardToken);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        BOT HELPER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Checks if a claim can be executed based on the price condition
+     * @dev Returns true if:
+     *      - poolManager is not configured (price check disabled)
+     *      - targetPrice is 0 (price check disabled)
+     *      - current phUSD price >= targetPrice
+     * @return True if claim() would not revert due to price check
+     */
+    function canClaim() external view returns (bool) {
+        // If price check is disabled, always return true
+        if (address(poolManager) == address(0) || targetPrice == 0) {
+            return true;
+        }
+
+        // Check if current price meets the target
+        uint256 currentPrice = _getPhUSDPriceInUSDS();
+        return currentPrice >= targetPrice;
+    }
+
+    /**
+     * @notice Returns the current phUSD price in USDS terms
+     * @dev Returns 0 if poolManager is not configured
+     * @return Current phUSD price with 18 decimal precision
+     */
+    function claimPrice() external view returns (uint256) {
+        // Return 0 if pool manager not configured
+        if (address(poolManager) == address(0)) {
+            return 0;
+        }
+
+        return _getPhUSDPriceInUSDS();
     }
 
     /*//////////////////////////////////////////////////////////////
