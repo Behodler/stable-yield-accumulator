@@ -7,6 +7,7 @@ import "../src/interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
 import "phlimbo-ea/interfaces/IPhlimbo.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {PoolId} from "v4-core/types/PoolId.sol";
 
 /**
  * @title MockERC20
@@ -1245,5 +1246,498 @@ contract StableYieldAccumulatorTest is Test {
 
         assertEq(individualUsdcYield, usdcYield, "getYield for USDC strategy should return native 6-decimal value");
         assertEq(individualDolaYield, dolaYield, "getYield for DOLA strategy should return native 18-decimal value");
+    }
+}
+
+/**
+ * @title MockPoolManager
+ * @notice Mock Uniswap V4 PoolManager for testing price queries
+ * @dev Provides configurable sqrtPriceX96 for slot0 queries
+ */
+contract MockPoolManager {
+    uint160 public sqrtPriceX96;
+    int24 public tick;
+    uint24 public protocolFee;
+    uint24 public lpFee;
+
+    // Mapping for extsload simulation
+    mapping(bytes32 => bytes32) public slots;
+
+    function setSqrtPriceX96(uint160 _sqrtPriceX96) external {
+        sqrtPriceX96 = _sqrtPriceX96;
+    }
+
+    function setSlot0(uint160 _sqrtPriceX96, int24 _tick, uint24 _protocolFee, uint24 _lpFee) external {
+        sqrtPriceX96 = _sqrtPriceX96;
+        tick = _tick;
+        protocolFee = _protocolFee;
+        lpFee = _lpFee;
+    }
+
+    /**
+     * @notice Mock extsload that returns packed slot0 data
+     * @dev StateLibrary.getSlot0 uses this to get pool data
+     */
+    function extsload(bytes32 slot) external view returns (bytes32) {
+        // Pack slot0 data: sqrtPriceX96 (160 bits) | tick (24 bits) | protocolFee (24 bits) | lpFee (24 bits)
+        // Layout: lpFee (24) | protocolFee (24) | tick (24) | sqrtPriceX96 (160)
+        uint256 packed = uint256(sqrtPriceX96);
+        packed |= uint256(uint24(tick)) << 160;
+        packed |= uint256(protocolFee) << 184;
+        packed |= uint256(lpFee) << 208;
+        return bytes32(packed);
+    }
+
+    function extsload(bytes32, uint256) external pure returns (bytes32[] memory) {
+        return new bytes32[](0);
+    }
+}
+
+/**
+ * @title MockSUSDS
+ * @notice Mock sUSDS ERC4626 vault for testing convertToAssets
+ * @dev Provides configurable exchange rate for sUSDS -> USDS conversion
+ */
+contract MockSUSDS {
+    // Exchange rate: 1 sUSDS = exchangeRate / 1e18 USDS
+    // e.g., 1.05e18 means 1 sUSDS = 1.05 USDS
+    uint256 public exchangeRate = 1e18;
+
+    function setExchangeRate(uint256 _rate) external {
+        exchangeRate = _rate;
+    }
+
+    /**
+     * @notice Convert sUSDS shares to USDS assets
+     * @param shares Amount of sUSDS shares
+     * @return Amount of USDS assets
+     */
+    function convertToAssets(uint256 shares) external view returns (uint256) {
+        return shares * exchangeRate / 1e18;
+    }
+}
+
+/**
+ * @title ConditionalClaimTest
+ * @notice Tests for the conditional claim execution feature based on phUSD/sUSDS spot price
+ */
+contract ConditionalClaimTest is Test {
+    StableYieldAccumulator public accumulator;
+    MockERC20 public rewardToken;
+    MockERC20 public strategyToken1;
+    MockYieldStrategy public mockStrategy1;
+    MockPhlimbo public mockPhlimbo;
+    MockPoolManager public mockPoolManager;
+    MockSUSDS public mockSUSDS;
+
+    address public owner;
+    address public minterAddr;
+    address public phlimboAddr;
+    address public claimer;
+
+    // Events
+    event PoolManagerUpdated(address indexed oldPoolManager, address indexed newPoolManager);
+    event PricePoolUpdated(PoolId indexed poolId, bool token0IsPhUSD);
+    event SUSDSUpdated(address indexed oldSUSDS, address indexed newSUSDS);
+    event TargetPriceUpdated(uint256 oldTargetPrice, uint256 newTargetPrice);
+
+    function setUp() public {
+        owner = address(this);
+        minterAddr = makeAddr("minter");
+        claimer = makeAddr("claimer");
+
+        // Deploy mock tokens
+        rewardToken = new MockERC20("Reward Token", "RWD");
+        strategyToken1 = new MockERC20("Strategy Token 1", "STK1");
+
+        // Deploy mock contracts
+        mockStrategy1 = new MockYieldStrategy();
+        mockPoolManager = new MockPoolManager();
+        mockSUSDS = new MockSUSDS();
+
+        // Deploy accumulator
+        accumulator = new StableYieldAccumulator();
+
+        // Deploy mock Phlimbo
+        mockPhlimbo = new MockPhlimbo(address(rewardToken));
+        mockPhlimbo.setYieldAccumulator(address(accumulator));
+        phlimboAddr = address(mockPhlimbo);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    OWNER FUNCTION ACCESS CONTROL TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_setPoolManager_OnlyOwner() public {
+        vm.prank(claimer);
+        vm.expectRevert();
+        accumulator.setPoolManager(address(mockPoolManager));
+    }
+
+    function test_setPoolManager_Success() public {
+        vm.expectEmit(true, true, false, true);
+        emit PoolManagerUpdated(address(0), address(mockPoolManager));
+        accumulator.setPoolManager(address(mockPoolManager));
+
+        assertEq(address(accumulator.poolManager()), address(mockPoolManager));
+    }
+
+    function test_setPoolManager_CanSetToZero() public {
+        accumulator.setPoolManager(address(mockPoolManager));
+        accumulator.setPoolManager(address(0));
+        assertEq(address(accumulator.poolManager()), address(0));
+    }
+
+    function test_setPricePool_OnlyOwner() public {
+        PoolId poolId = PoolId.wrap(bytes32(uint256(1)));
+        vm.prank(claimer);
+        vm.expectRevert();
+        accumulator.setPricePool(poolId, true);
+    }
+
+    function test_setPricePool_Success() public {
+        PoolId poolId = PoolId.wrap(bytes32(uint256(123)));
+
+        vm.expectEmit(true, false, false, true);
+        emit PricePoolUpdated(poolId, true);
+        accumulator.setPricePool(poolId, true);
+
+        assertTrue(PoolId.unwrap(accumulator.pricePoolId()) == bytes32(uint256(123)));
+        assertTrue(accumulator.token0IsPhUSD());
+    }
+
+    function test_setSUSDS_OnlyOwner() public {
+        vm.prank(claimer);
+        vm.expectRevert();
+        accumulator.setSUSDS(address(mockSUSDS));
+    }
+
+    function test_setSUSDS_Success() public {
+        vm.expectEmit(true, true, false, true);
+        emit SUSDSUpdated(address(0), address(mockSUSDS));
+        accumulator.setSUSDS(address(mockSUSDS));
+
+        assertEq(address(accumulator.sUSDS()), address(mockSUSDS));
+    }
+
+    function test_setTargetPrice_OnlyOwner() public {
+        vm.prank(claimer);
+        vm.expectRevert();
+        accumulator.setTargetPrice(1e18);
+    }
+
+    function test_setTargetPrice_Success() public {
+        vm.expectEmit(false, false, false, true);
+        emit TargetPriceUpdated(0, 1e18);
+        accumulator.setTargetPrice(1e18);
+
+        assertEq(accumulator.targetPrice(), 1e18);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    PRICE CALCULATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Helper to set up price check infrastructure
+     */
+    function _setupPriceCheck(uint160 sqrtPriceX96, uint256 sUSDSRate, bool token0IsPhUSD) internal {
+        accumulator.setPoolManager(address(mockPoolManager));
+        accumulator.setSUSDS(address(mockSUSDS));
+
+        PoolId poolId = PoolId.wrap(bytes32(uint256(1)));
+        accumulator.setPricePool(poolId, token0IsPhUSD);
+
+        mockPoolManager.setSqrtPriceX96(sqrtPriceX96);
+        mockSUSDS.setExchangeRate(sUSDSRate);
+    }
+
+    function test_claimPrice_ReturnsZeroIfPoolManagerNotSet() public {
+        uint256 price = accumulator.claimPrice();
+        assertEq(price, 0, "Should return 0 if poolManager not set");
+    }
+
+    function test_claimPrice_ReturnsPriceWhenConfigured() public {
+        // Set sqrtPriceX96 for price = 1.0 (1e18)
+        // sqrtPriceX96 = sqrt(1) * 2^96 = 2^96 = 79228162514264337593543950336
+        uint160 sqrtPriceX96 = 79228162514264337593543950336;
+
+        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+
+        uint256 price = accumulator.claimPrice();
+        // Price should be approximately 1e18 (within precision tolerance)
+        assertApproxEqRel(price, 1e18, 0.01e18, "Price should be approximately 1e18");
+    }
+
+    function test_claimPrice_Token0IsPhUSD_PriceAbove1() public {
+        // sqrtPriceX96 for price = 1.1 (phUSD is worth 1.1 sUSDS)
+        // sqrt(1.1) * 2^96 ≈ 83077498137502453155780008628
+        uint160 sqrtPriceX96 = 83077498137502453155780008628;
+
+        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+
+        uint256 price = accumulator.claimPrice();
+        // Should be approximately 1.1e18
+        assertApproxEqRel(price, 1.1e18, 0.01e18, "Price should be approximately 1.1e18");
+    }
+
+    function test_claimPrice_Token1IsPhUSD_PriceAbove1() public {
+        // When token1 is phUSD, sqrtPriceX96 represents sqrt(phUSD/sUSDS)
+        // For phUSD price = 1.1 sUSDS, sqrtPriceX96 = sqrt(1.1) * 2^96
+        uint160 sqrtPriceX96 = 83077498137502453155780008628;
+
+        _setupPriceCheck(sqrtPriceX96, 1e18, false);
+
+        uint256 price = accumulator.claimPrice();
+        // When token1IsPhUSD, we need 1/price, so price in sUSDS ≈ 0.909e18
+        // But wait - if token1 is phUSD, then sqrtPriceX96 represents sqrt(phUSD/sUSDS)
+        // So phUSD price = (sqrtPriceX96)^2 / 2^192 = 1.1
+        // But we invert it: price = 2^192 / sqrtPriceX96^2 ≈ 0.909
+        assertApproxEqRel(price, 0.909e18, 0.02e18, "Price should be approximately 0.909e18");
+    }
+
+    function test_claimPrice_WithSUSDSConversion() public {
+        // sqrtPriceX96 for price = 1.0 in sUSDS terms
+        uint160 sqrtPriceX96 = 79228162514264337593543950336;
+
+        // sUSDS exchange rate: 1 sUSDS = 1.05 USDS
+        _setupPriceCheck(sqrtPriceX96, 1.05e18, true);
+
+        uint256 price = accumulator.claimPrice();
+        // 1 phUSD = 1 sUSDS, and 1 sUSDS = 1.05 USDS
+        // So 1 phUSD = 1.05 USDS
+        assertApproxEqRel(price, 1.05e18, 0.01e18, "Price should be approximately 1.05e18 with sUSDS conversion");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    canClaim TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_canClaim_TrueWhenPoolManagerNotSet() public {
+        assertTrue(accumulator.canClaim(), "Should return true when poolManager not set");
+    }
+
+    function test_canClaim_TrueWhenTargetPriceIsZero() public {
+        accumulator.setPoolManager(address(mockPoolManager));
+        // Don't set targetPrice (stays 0)
+        assertTrue(accumulator.canClaim(), "Should return true when targetPrice is 0");
+    }
+
+    function test_canClaim_TrueWhenPriceAboveTarget() public {
+        // Price = 1.1e18
+        uint160 sqrtPriceX96 = 83077498137502453155780008628;
+        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+
+        // Target = 1.0e18
+        accumulator.setTargetPrice(1e18);
+
+        assertTrue(accumulator.canClaim(), "Should return true when price >= target");
+    }
+
+    function test_canClaim_TrueWhenPriceEqualsTarget() public {
+        // Price = 1.0e18
+        uint160 sqrtPriceX96 = 79228162514264337593543950336;
+        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+
+        // Target = 1.0e18
+        accumulator.setTargetPrice(1e18);
+
+        assertTrue(accumulator.canClaim(), "Should return true when price == target");
+    }
+
+    function test_canClaim_FalseWhenPriceBelowTarget() public {
+        // Price = 0.9e18
+        // sqrt(0.9) * 2^96 ≈ 75166920096232236089664808974
+        uint160 sqrtPriceX96 = 75166920096232236089664808974;
+        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+
+        // Target = 1.0e18
+        accumulator.setTargetPrice(1e18);
+
+        assertFalse(accumulator.canClaim(), "Should return false when price < target");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    CLAIM WITH PRICE CHECK TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Helper to set up a complete claim scenario with price check
+     */
+    function _setupClaimWithPriceCheck(uint256 yieldAmount, uint160 sqrtPriceX96, uint256 targetPriceValue) internal {
+        // Setup basic claim infrastructure
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200); // 2% discount
+
+        // Add strategy with token
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+
+        // Set token config
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        // Set up mock strategy with yield
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
+        strategyToken1.mint(address(mockStrategy1), yieldAmount);
+
+        // Setup price check
+        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+        accumulator.setTargetPrice(targetPriceValue);
+
+        // Fund claimer with reward tokens
+        uint256 claimerPayment = yieldAmount * 98 / 100;
+        rewardToken.mint(claimer, claimerPayment + 1e18);
+
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        // Approve Phlimbo
+        accumulator.approvePhlimbo(type(uint256).max);
+    }
+
+    function test_claim_SucceedsWhenPriceAboveTarget() public {
+        uint256 yieldAmount = 100e18;
+        // Price = 1.1e18
+        uint160 sqrtPriceX96 = 83077498137502453155780008628;
+        // Target = 1.0e18
+        uint256 targetPriceValue = 1e18;
+
+        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
+
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+
+        vm.prank(claimer);
+        accumulator.claim();
+
+        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
+        assertEq(claimerYieldAfter - claimerYieldBefore, yieldAmount, "Claimer should receive yield tokens");
+    }
+
+    function test_claim_RevertsWhenPriceBelowTarget() public {
+        uint256 yieldAmount = 100e18;
+        // Price = 0.9e18
+        uint160 sqrtPriceX96 = 75166920096232236089664808974;
+        // Target = 1.0e18
+        uint256 targetPriceValue = 1e18;
+
+        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
+
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.PriceBelowTarget.selector);
+        accumulator.claim();
+    }
+
+    function test_claim_SucceedsWhenPoolManagerNotSet() public {
+        uint256 yieldAmount = 100e18;
+
+        // Setup basic claim infrastructure WITHOUT price check
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200);
+
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
+        strategyToken1.mint(address(mockStrategy1), yieldAmount);
+
+        uint256 claimerPayment = yieldAmount * 98 / 100;
+        rewardToken.mint(claimer, claimerPayment + 1e18);
+
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        accumulator.approvePhlimbo(type(uint256).max);
+
+        // Set target price but NOT pool manager
+        accumulator.setTargetPrice(1e18);
+
+        // Should succeed because pool manager not set (graceful skip)
+        vm.prank(claimer);
+        accumulator.claim();
+
+        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed with poolManager not set");
+    }
+
+    function test_claim_SucceedsWhenTargetPriceIsZero() public {
+        uint256 yieldAmount = 100e18;
+        // Price = 0.9e18 (below typical target)
+        uint160 sqrtPriceX96 = 75166920096232236089664808974;
+        // Target = 0 (disabled)
+        uint256 targetPriceValue = 0;
+
+        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
+
+        // Should succeed because targetPrice is 0 (graceful skip)
+        vm.prank(claimer);
+        accumulator.claim();
+
+        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed with targetPrice = 0");
+    }
+
+    function test_claim_SucceedsWhenPriceExactlyEqualsTarget() public {
+        uint256 yieldAmount = 100e18;
+        // Price = 1.0e18
+        uint160 sqrtPriceX96 = 79228162514264337593543950336;
+        // Target = 1.0e18
+        uint256 targetPriceValue = 1e18;
+
+        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
+
+        vm.prank(claimer);
+        accumulator.claim();
+
+        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed when price == target");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    INTEGRATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_fullFlow_ConditionalClaimWithPriceIncrease() public {
+        uint256 yieldAmount = 100e18;
+
+        // Initial price = 0.9e18 (below target)
+        uint160 lowPriceX96 = 75166920096232236089664808974;
+        // Target = 1.0e18
+        uint256 targetPriceValue = 1e18;
+
+        _setupClaimWithPriceCheck(yieldAmount, lowPriceX96, targetPriceValue);
+
+        // First attempt should fail
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.PriceBelowTarget.selector);
+        accumulator.claim();
+
+        // Price increases to 1.1e18
+        uint160 highPriceX96 = 83077498137502453155780008628;
+        mockPoolManager.setSqrtPriceX96(highPriceX96);
+
+        // Now canClaim should return true
+        assertTrue(accumulator.canClaim(), "canClaim should return true after price increase");
+
+        // Second attempt should succeed
+        vm.prank(claimer);
+        accumulator.claim();
+
+        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed after price increase");
+    }
+
+    function test_configurationUpdate_TargetPriceChange() public {
+        // Setup with price = 0.95e18
+        uint160 sqrtPriceX96 = 77193234817629166689178055120; // sqrt(0.95) * 2^96
+        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+
+        // Target = 1.0e18 (price below target)
+        accumulator.setTargetPrice(1e18);
+        assertFalse(accumulator.canClaim(), "Should be false with target = 1.0e18");
+
+        // Lower target to 0.9e18 (price now above target)
+        accumulator.setTargetPrice(0.9e18);
+        assertTrue(accumulator.canClaim(), "Should be true after lowering target");
     }
 }
