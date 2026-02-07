@@ -156,6 +156,12 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      */
     bool public token0IsPhUSD;
 
+    /**
+     * @notice Address of the phUSD token
+     * @dev Included in the phUSDPriceBelowTarget error to assist MEV bots
+     */
+    address public phUSD;
+
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -201,6 +207,13 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @param newTargetPrice New target price
      */
     event TargetPriceUpdated(uint256 oldTargetPrice, uint256 newTargetPrice);
+
+    /**
+     * @notice Emitted when the phUSD address is updated
+     * @param oldPhUSD Previous phUSD address
+     * @param newPhUSD New phUSD address
+     */
+    event PhUSDUpdated(address indexed oldPhUSD, address indexed newPhUSD);
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -519,6 +532,18 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         emit TargetPriceUpdated(oldTargetPrice, _targetPrice);
     }
 
+    /**
+     * @notice Sets the phUSD token address
+     * @dev Used in the phUSDPriceBelowTarget error to assist MEV bots in identifying
+     *      the token, pool manager, and pool when a claim fails the price minimum check
+     * @param _phUSD Address of the phUSD token
+     */
+    function setPhUSD(address _phUSD) external onlyOwner {
+        address oldPhUSD = phUSD;
+        phUSD = _phUSD;
+        emit PhUSDUpdated(oldPhUSD, _phUSD);
+    }
+
     /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
     //////////////////////////////////////////////////////////////*/
@@ -526,10 +551,11 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full claim flow:
-     *      1. Calculate total pending yield across all strategies (normalized to 18 decimals)
-     *      2. Apply discount to get claimer payment amount
-     *      3. Transfer rewardToken FROM claimer TO phlimbo
-     *      4. Withdraw yield FROM each strategy TO claimer
+     *      1. Enforce price minimum: phUSD spot price must meet target threshold
+     *      2. Calculate total pending yield across all strategies (normalized to 18 decimals)
+     *      3. Apply discount to get claimer payment amount
+     *      4. Transfer rewardToken FROM claimer TO phlimbo
+     *      5. Withdraw yield FROM each strategy TO claimer
      *
      * Example with 2% discount:
      * - Strategy A has 10 USDT pending, Strategy B has 5 USDS pending
@@ -542,11 +568,13 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         if (rewardToken == address(0)) revert ZeroAddress();
         if (minterAddress == address(0)) revert ZeroAddress();
 
-        // Conditional price check: only allow claim if phUSD price >= target
+        // Price minimum check: only allow claim if phUSD spot price >= target price
         // Skip check if poolManager is not set or targetPrice is 0 (graceful degradation)
         if (address(poolManager) != address(0) && targetPrice > 0) {
             uint256 currentPrice = _getPhUSDPriceInUSDS();
-            if (currentPrice < targetPrice) revert PriceBelowTarget();
+            if (currentPrice < targetPrice) {
+                revert phUSDPriceBelowTarget(phUSD, address(poolManager), uint256(PoolId.unwrap(pricePoolId)));
+            }
         }
 
         uint256 totalNormalizedYield = 0;
