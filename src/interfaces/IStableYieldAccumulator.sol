@@ -146,9 +146,12 @@ interface IStableYieldAccumulator {
     error ZeroAmount();
 
     /**
-     * @notice Thrown when trying to claim but phUSD price is below target
+     * @notice Thrown when trying to claim but phUSD price is below the price minimum
+     * @param phUSD Address of the phUSD token
+     * @param poolManager Address of the Uniswap V4 PoolManager used for price queries
+     * @param pricePoolId The pool identifier used for the price check (as uint256)
      */
-    error PriceBelowTarget();
+    error phUSDPriceBelowTarget(address phUSD, address poolManager, uint256 pricePoolId);
 
     /*//////////////////////////////////////////////////////////////
                         YIELD STRATEGY MANAGEMENT
@@ -255,10 +258,11 @@ interface IStableYieldAccumulator {
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full flow:
-     *      1. Calculate total pending yield (normalized)
-     *      2. Apply discount to get claimer payment
-     *      3. TransferFrom claimer to phlimbo
-     *      4. WithdrawFrom each strategy to claimer
+     *      1. Enforce price minimum: phUSD spot price must meet target threshold
+     *      2. Calculate total pending yield (normalized)
+     *      3. Apply discount to get claimer payment
+     *      4. TransferFrom claimer to phlimbo
+     *      5. WithdrawFrom each strategy to claimer
      */
     function claim() external;
 
@@ -321,6 +325,13 @@ interface IStableYieldAccumulator {
     function setTargetPrice(uint256 _targetPrice) external;
 
     /**
+     * @notice Sets the phUSD token address
+     * @dev Used in the phUSDPriceBelowTarget error to assist bots
+     * @param _phUSD Address of the phUSD token
+     */
+    function setPhUSD(address _phUSD) external;
+
+    /**
      * @notice Gets the current Uniswap V4 PoolManager address
      * @return Address of the PoolManager contract
      */
@@ -349,6 +360,12 @@ interface IStableYieldAccumulator {
      * @return True if phUSD is currency0 in the price pool
      */
     function token0IsPhUSD() external view returns (bool);
+
+    /**
+     * @notice Gets the phUSD token address
+     * @return Address of the phUSD token
+     */
+    function phUSD() external view returns (address);
 
     /*//////////////////////////////////////////////////////////////
                         BOT HELPER FUNCTIONS

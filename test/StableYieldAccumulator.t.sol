@@ -1334,17 +1334,20 @@ contract ConditionalClaimTest is Test {
     address public minterAddr;
     address public phlimboAddr;
     address public claimer;
+    address public phUSDAddr;
 
     // Events
     event PoolManagerUpdated(address indexed oldPoolManager, address indexed newPoolManager);
     event PricePoolUpdated(PoolId indexed poolId, bool token0IsPhUSD);
     event SUSDSUpdated(address indexed oldSUSDS, address indexed newSUSDS);
     event TargetPriceUpdated(uint256 oldTargetPrice, uint256 newTargetPrice);
+    event PhUSDUpdated(address indexed oldPhUSD, address indexed newPhUSD);
 
     function setUp() public {
         owner = address(this);
         minterAddr = makeAddr("minter");
         claimer = makeAddr("claimer");
+        phUSDAddr = makeAddr("phUSD");
 
         // Deploy mock tokens
         rewardToken = new MockERC20("Reward Token", "RWD");
@@ -1434,6 +1437,20 @@ contract ConditionalClaimTest is Test {
         assertEq(accumulator.targetPrice(), 1e18);
     }
 
+    function test_setPhUSD_OnlyOwner() public {
+        vm.prank(claimer);
+        vm.expectRevert();
+        accumulator.setPhUSD(phUSDAddr);
+    }
+
+    function test_setPhUSD_Success() public {
+        vm.expectEmit(true, true, false, true);
+        emit PhUSDUpdated(address(0), phUSDAddr);
+        accumulator.setPhUSD(phUSDAddr);
+
+        assertEq(accumulator.phUSD(), phUSDAddr);
+    }
+
     /*//////////////////////////////////////////////////////////////
                     PRICE CALCULATION TESTS
     //////////////////////////////////////////////////////////////*/
@@ -1444,6 +1461,7 @@ contract ConditionalClaimTest is Test {
     function _setupPriceCheck(uint160 sqrtPriceX96, uint256 sUSDSRate, bool token0IsPhUSD) internal {
         accumulator.setPoolManager(address(mockPoolManager));
         accumulator.setSUSDS(address(mockSUSDS));
+        accumulator.setPhUSD(phUSDAddr);
 
         PoolId poolId = PoolId.wrap(bytes32(uint256(1)));
         accumulator.setPricePool(poolId, token0IsPhUSD);
@@ -1625,7 +1643,12 @@ contract ConditionalClaimTest is Test {
         _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
 
         vm.prank(claimer);
-        vm.expectRevert(IStableYieldAccumulator.PriceBelowTarget.selector);
+        vm.expectRevert(abi.encodeWithSelector(
+            IStableYieldAccumulator.phUSDPriceBelowTarget.selector,
+            phUSDAddr,
+            address(mockPoolManager),
+            uint256(PoolId.unwrap(PoolId.wrap(bytes32(uint256(1)))))
+        ));
         accumulator.claim();
     }
 
@@ -1708,9 +1731,14 @@ contract ConditionalClaimTest is Test {
 
         _setupClaimWithPriceCheck(yieldAmount, lowPriceX96, targetPriceValue);
 
-        // First attempt should fail
+        // First attempt should fail - price below minimum
         vm.prank(claimer);
-        vm.expectRevert(IStableYieldAccumulator.PriceBelowTarget.selector);
+        vm.expectRevert(abi.encodeWithSelector(
+            IStableYieldAccumulator.phUSDPriceBelowTarget.selector,
+            phUSDAddr,
+            address(mockPoolManager),
+            uint256(PoolId.unwrap(PoolId.wrap(bytes32(uint256(1)))))
+        ));
         accumulator.claim();
 
         // Price increases to 1.1e18
