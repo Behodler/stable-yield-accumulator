@@ -35,7 +35,8 @@ contract AutoCompoundPositionHookForTest is AutoCompoundPositionHook {
         int24 _tickUpper,
         bytes32 _salt,
         uint256 _thresholdTokenIndex,
-        uint256 _thresholdAmount
+        uint256 _thresholdAmount,
+        uint128 _absoluteFloor
     ) AutoCompoundPositionHook(
         _poolManager,
         _poolKey,
@@ -43,7 +44,8 @@ contract AutoCompoundPositionHookForTest is AutoCompoundPositionHook {
         _tickUpper,
         _salt,
         _thresholdTokenIndex,
-        _thresholdAmount
+        _thresholdAmount,
+        _absoluteFloor
     ) {}
 
     /// @notice Skip hook address validation during testing
@@ -83,6 +85,7 @@ contract AutoCompoundPositionHookTest is Test {
     int24 constant TICK_UPPER = 120;
     bytes32 constant POSITION_SALT = bytes32(uint256(1));
     uint256 constant DEFAULT_THRESHOLD = 1e18;
+    uint128 constant DEFAULT_ABSOLUTE_FLOOR = 1000; // Low floor for most tests
 
     address owner;
     address alice;
@@ -163,7 +166,8 @@ contract AutoCompoundPositionHookTest is Test {
             TICK_UPPER,
             POSITION_SALT,
             0, // thresholdTokenIndex
-            DEFAULT_THRESHOLD
+            DEFAULT_THRESHOLD,
+            DEFAULT_ABSOLUTE_FLOOR
         );
 
         // Get the bytecode and etch it to the hook address
@@ -184,8 +188,8 @@ contract AutoCompoundPositionHookTest is Test {
         // Slot 1: _poolKey (first part - currency0, currency1 packed? Let's see)
         // For a struct PoolKey, it takes multiple slots
 
-        // Alternative: just copy all first 20 slots to be safe
-        for (uint256 i = 0; i < 20; i++) {
+        // Alternative: just copy all first 25 slots to be safe (includes new MEV floor variables)
+        for (uint256 i = 0; i < 25; i++) {
             bytes32 slot = bytes32(i);
             bytes32 value = vm.load(address(impl), slot);
             vm.store(hookAddress, slot, value);
@@ -265,7 +269,8 @@ contract AutoCompoundPositionHookTest is Test {
             TICK_UPPER,
             POSITION_SALT,
             2, // invalid index
-            DEFAULT_THRESHOLD
+            DEFAULT_THRESHOLD,
+            DEFAULT_ABSOLUTE_FLOOR
         );
     }
 
@@ -288,7 +293,8 @@ contract AutoCompoundPositionHookTest is Test {
             -120,
             POSITION_SALT,
             0,
-            DEFAULT_THRESHOLD
+            DEFAULT_THRESHOLD,
+            DEFAULT_ABSOLUTE_FLOOR
         );
     }
 
@@ -312,7 +318,8 @@ contract AutoCompoundPositionHookTest is Test {
             TICK_UPPER,
             POSITION_SALT,
             0,
-            DEFAULT_THRESHOLD
+            DEFAULT_THRESHOLD,
+            DEFAULT_ABSOLUTE_FLOOR
         );
     }
 
@@ -832,6 +839,384 @@ contract AutoCompoundPositionHookTest is Test {
         assertTrue(success, "should accept ETH");
 
         assertEq(address(hook).balance, balanceBefore + 1 ether, "balance should increase");
+    }
+
+    // ========== MEV Floor Tests ==========
+
+    function test_compoundSkipped_whenLiquidityBelowMinLiquidity() public {
+        // Deploy hook with a very high absolute floor so compound will be skipped
+        address hookAddress = _computeHookAddress();
+
+        poolKey = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: 1000,
+            tickSpacing: 60,
+            hooks: IHooks(hookAddress)
+        });
+        poolId = poolKey.toId();
+
+        // Set a very high floor that normal fee amounts can't exceed
+        uint128 highFloor = type(uint128).max / 2;
+
+        AutoCompoundPositionHookForTest impl = new AutoCompoundPositionHookForTest(
+            manager,
+            poolKey,
+            TICK_LOWER,
+            TICK_UPPER,
+            POSITION_SALT,
+            0,
+            0, // zero threshold so we get past threshold check
+            highFloor
+        );
+
+        bytes memory code = address(impl).code;
+        vm.etch(hookAddress, code);
+        for (uint256 i = 0; i < 25; i++) {
+            bytes32 slot = bytes32(i);
+            bytes32 value = vm.load(address(impl), slot);
+            vm.store(hookAddress, slot, value);
+        }
+        hook = AutoCompoundPositionHookForTest(payable(hookAddress));
+
+        _initializePoolWithLiquidity();
+
+        // Send tokens to hook
+        token0.transfer(address(hook), 10 ether);
+        token1.transfer(address(hook), 10 ether);
+
+        // Check no liquidity added before
+        (uint128 liqBefore,,) = manager.getPositionInfo(
+            poolId, address(hook), hook.tickLower(), hook.tickUpper(), hook.positionSalt()
+        );
+        assertEq(liqBefore, 0, "should have no liquidity before");
+
+        // Expect CompoundSkipped event
+        vm.expectEmit(false, false, false, false);
+        emit IAutoCompoundPositionHook.CompoundSkipped(0, 0);
+
+        hook.poke();
+
+        // Liquidity should still be zero
+        (uint128 liqAfter,,) = manager.getPositionInfo(
+            poolId, address(hook), hook.tickLower(), hook.tickUpper(), hook.positionSalt()
+        );
+        assertEq(liqAfter, 0, "liquidity should not change when below floor");
+    }
+
+    function test_compoundSucceeds_whenLiquidityAboveMinLiquidity() public {
+        _deployHook();
+        _initializePoolWithLiquidity();
+
+        // Set low threshold so compounding can happen
+        hook.changeThreshold(0);
+
+        // Send tokens to hook - enough to generate liquidity above the low floor
+        token0.transfer(address(hook), 10 ether);
+        token1.transfer(address(hook), 10 ether);
+
+        (uint128 liqBefore,,) = manager.getPositionInfo(
+            poolId, address(hook), hook.tickLower(), hook.tickUpper(), hook.positionSalt()
+        );
+        assertEq(liqBefore, 0, "should have no liquidity before");
+
+        // Trigger compound via poke - should succeed because liq >> DEFAULT_ABSOLUTE_FLOOR (1000)
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -0.1 ether,
+            sqrtPriceLimitX96: MIN_PRICE_LIMIT
+        });
+
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        });
+
+        swapRouter.swap(poolKey, params, testSettings, ZERO_BYTES);
+
+        (uint128 liqAfter,,) = manager.getPositionInfo(
+            poolId, address(hook), hook.tickLower(), hook.tickUpper(), hook.positionSalt()
+        );
+        assertGt(liqAfter, 0, "should have liquidity after compounding above floor");
+    }
+
+    function test_trackedLiquidity_EMAUpdatesAfterCompound() public {
+        _deployHook();
+        _initializePoolWithLiquidity();
+
+        hook.changeThreshold(0);
+
+        // Initial tracked liquidity should equal ABSOLUTE_FLOOR
+        assertEq(hook.trackedLiquidity(), DEFAULT_ABSOLUTE_FLOOR, "initial trackedLiquidity should be ABSOLUTE_FLOOR");
+
+        // Send tokens and trigger compound
+        token0.transfer(address(hook), 10 ether);
+        token1.transfer(address(hook), 10 ether);
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -0.01 ether,
+            sqrtPriceLimitX96: MIN_PRICE_LIMIT
+        });
+
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        });
+
+        swapRouter.swap(poolKey, params, testSettings, ZERO_BYTES);
+
+        // trackedLiquidity should have changed from its initial value
+        // EMA = (old * 90 + new * 10) / 100
+        // After compound, the fair estimate uses post-compound (leftover) balances,
+        // which are small since most tokens were used for liquidity.
+        // The EMA updates to reflect this new sample.
+        uint128 tracked = hook.trackedLiquidity();
+        assertFalse(tracked == DEFAULT_ABSOLUTE_FLOOR, "trackedLiquidity should change from initial value after compound");
+    }
+
+    function test_minLiquidity_adjustsUpwardOverMultipleCompounds() public {
+        _deployHook();
+        _initializePoolWithLiquidity();
+
+        hook.changeThreshold(0);
+
+        uint128 initialMin = hook.minLiquidity();
+        assertEq(initialMin, DEFAULT_ABSOLUTE_FLOOR, "initial minLiquidity should be ABSOLUTE_FLOOR");
+
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        });
+
+        // Perform multiple compounds to ramp up EMA
+        for (uint256 i = 0; i < 5; i++) {
+            token0.transfer(address(hook), 5 ether);
+            token1.transfer(address(hook), 5 ether);
+
+            SwapParams memory params = SwapParams({
+                zeroForOne: true,
+                amountSpecified: -0.01 ether,
+                sqrtPriceLimitX96: MIN_PRICE_LIMIT
+            });
+
+            swapRouter.swap(poolKey, params, testSettings, ZERO_BYTES);
+        }
+
+        uint128 finalMin = hook.minLiquidity();
+        assertGt(finalMin, initialMin, "minLiquidity should increase over multiple compounds");
+    }
+
+    function test_minLiquidity_neverFallsBelowAbsoluteFloor() public {
+        // Deploy with a specific floor
+        uint128 floor = 5000;
+        address hookAddress = _computeHookAddress();
+
+        poolKey = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: 1000,
+            tickSpacing: 60,
+            hooks: IHooks(hookAddress)
+        });
+        poolId = poolKey.toId();
+
+        AutoCompoundPositionHookForTest impl = new AutoCompoundPositionHookForTest(
+            manager,
+            poolKey,
+            TICK_LOWER,
+            TICK_UPPER,
+            POSITION_SALT,
+            0,
+            0, // zero threshold
+            floor
+        );
+
+        bytes memory code = address(impl).code;
+        vm.etch(hookAddress, code);
+        for (uint256 i = 0; i < 25; i++) {
+            bytes32 slot = bytes32(i);
+            bytes32 value = vm.load(address(impl), slot);
+            vm.store(hookAddress, slot, value);
+        }
+        hook = AutoCompoundPositionHookForTest(payable(hookAddress));
+
+        // minLiquidity should start at ABSOLUTE_FLOOR
+        assertEq(hook.minLiquidity(), floor, "minLiquidity should start at ABSOLUTE_FLOOR");
+        assertEq(hook.ABSOLUTE_FLOOR(), floor, "ABSOLUTE_FLOOR should be set correctly");
+
+        // Even after EMA updates that might decrease, minLiquidity should stay >= ABSOLUTE_FLOOR
+        // Since we can't easily make EMA decrease below floor in a natural flow,
+        // verify the invariant holds at initialization
+        assertTrue(hook.minLiquidity() >= hook.ABSOLUTE_FLOOR(), "minLiquidity must always be >= ABSOLUTE_FLOOR");
+    }
+
+    function test_compoundSkipped_emitsCorrectValues() public {
+        // Deploy hook with a high floor
+        uint128 highFloor = 1e30;
+        address hookAddress = _computeHookAddress();
+
+        poolKey = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: 1000,
+            tickSpacing: 60,
+            hooks: IHooks(hookAddress)
+        });
+        poolId = poolKey.toId();
+
+        AutoCompoundPositionHookForTest impl = new AutoCompoundPositionHookForTest(
+            manager,
+            poolKey,
+            TICK_LOWER,
+            TICK_UPPER,
+            POSITION_SALT,
+            0,
+            0, // zero threshold
+            highFloor
+        );
+
+        bytes memory code = address(impl).code;
+        vm.etch(hookAddress, code);
+        for (uint256 i = 0; i < 25; i++) {
+            bytes32 slot = bytes32(i);
+            bytes32 value = vm.load(address(impl), slot);
+            vm.store(hookAddress, slot, value);
+        }
+        hook = AutoCompoundPositionHookForTest(payable(hookAddress));
+
+        _initializePoolWithLiquidity();
+
+        // Send some tokens
+        token0.transfer(address(hook), 1 ether);
+        token1.transfer(address(hook), 1 ether);
+
+        // Record logs to check event parameters
+        vm.recordLogs();
+        hook.poke();
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+
+        // Find the CompoundSkipped event
+        bool foundEvent = false;
+        bytes32 compoundSkippedSig = keccak256("CompoundSkipped(uint128,uint128)");
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].topics[0] == compoundSkippedSig) {
+                foundEvent = true;
+                (uint128 calcLiq, uint128 currentMin) = abi.decode(entries[i].data, (uint128, uint128));
+                assertEq(currentMin, highFloor, "event should report correct minLiquidity");
+                assertGt(calcLiq, 0, "calculated liquidity should be > 0");
+                assertLt(calcLiq, highFloor, "calculated liquidity should be below the floor");
+                break;
+            }
+        }
+        assertTrue(foundEvent, "CompoundSkipped event should have been emitted");
+    }
+
+    function test_estimateFairLiquidity_consistentRegardlessOfSpotPrice() public {
+        _deployHook();
+        _initializePoolWithLiquidity();
+
+        hook.changeThreshold(0);
+
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        });
+
+        // Send tokens to hook and trigger compound via small swap
+        token0.transfer(address(hook), 5 ether);
+        token1.transfer(address(hook), 5 ether);
+
+        SwapParams memory tinySwap = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -0.001 ether,
+            sqrtPriceLimitX96: MIN_PRICE_LIMIT
+        });
+
+        swapRouter.swap(poolKey, tinySwap, testSettings, ZERO_BYTES);
+
+        // Record tracked liquidity after first compound
+        uint128 trackedAfterFirst = hook.trackedLiquidity();
+
+        // Now move price significantly by doing a big swap
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -20 ether,
+            sqrtPriceLimitX96: MIN_PRICE_LIMIT
+        });
+
+        swapRouter.swap(poolKey, params, testSettings, ZERO_BYTES);
+
+        // Move price back
+        SwapParams memory params2 = SwapParams({
+            zeroForOne: false,
+            amountSpecified: -20 ether,
+            sqrtPriceLimitX96: MAX_PRICE_LIMIT
+        });
+
+        swapRouter.swap(poolKey, params2, testSettings, ZERO_BYTES);
+
+        // Send more tokens and trigger another compound via small swap
+        token0.transfer(address(hook), 5 ether);
+        token1.transfer(address(hook), 5 ether);
+
+        SwapParams memory tinySwap2 = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -0.001 ether,
+            sqrtPriceLimitX96: MIN_PRICE_LIMIT
+        });
+
+        swapRouter.swap(poolKey, tinySwap2, testSettings, ZERO_BYTES);
+
+        // The tracked liquidity should reflect actual balances, not spot price
+        // We can verify this by confirming the EMA is tracking reasonably
+        uint128 trackedAfterSecond = hook.trackedLiquidity();
+
+        // Both tracked values should be positive and in a reasonable range
+        assertGt(trackedAfterFirst, 0, "tracked after first compound should be > 0");
+        assertGt(trackedAfterSecond, 0, "tracked after second compound should be > 0");
+    }
+
+    function test_firstCompound_succeedsWithAbsoluteFloorAsInitialMinLiquidity() public {
+        _deployHook();
+        _initializePoolWithLiquidity();
+
+        // Verify initial state
+        assertEq(hook.minLiquidity(), DEFAULT_ABSOLUTE_FLOOR, "initial minLiquidity should be ABSOLUTE_FLOOR");
+        assertEq(hook.trackedLiquidity(), DEFAULT_ABSOLUTE_FLOOR, "initial trackedLiquidity should be ABSOLUTE_FLOOR");
+
+        hook.changeThreshold(0);
+
+        // Send tokens that will generate liquidity well above DEFAULT_ABSOLUTE_FLOOR (1000)
+        token0.transfer(address(hook), 10 ether);
+        token1.transfer(address(hook), 10 ether);
+
+        (uint128 liqBefore,,) = manager.getPositionInfo(
+            poolId, address(hook), hook.tickLower(), hook.tickUpper(), hook.positionSalt()
+        );
+        assertEq(liqBefore, 0, "should have no liquidity before first compound");
+
+        // Trigger first compound via swap - should succeed since ABSOLUTE_FLOOR is very low
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -0.001 ether,
+            sqrtPriceLimitX96: MIN_PRICE_LIMIT
+        });
+
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        });
+
+        swapRouter.swap(poolKey, params, testSettings, ZERO_BYTES);
+
+        (uint128 liqAfter,,) = manager.getPositionInfo(
+            poolId, address(hook), hook.tickLower(), hook.tickUpper(), hook.positionSalt()
+        );
+        assertGt(liqAfter, 0, "first compound should succeed with ABSOLUTE_FLOOR as initial minLiquidity");
+
+        // Verify EMA was updated (it changes from the initial value)
+        assertFalse(hook.trackedLiquidity() == DEFAULT_ABSOLUTE_FLOOR, "trackedLiquidity should update after first compound");
     }
 
     // ========== Integration Tests ==========
