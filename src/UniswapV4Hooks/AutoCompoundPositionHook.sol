@@ -61,6 +61,21 @@ contract AutoCompoundPositionHook is BaseHook, Ownable, IAutoCompoundPositionHoo
     /// @notice Salt to uniquely identify the hook's position
     bytes32 public positionSalt;
 
+    /// @notice Dynamic floor - compounds below this liquidity amount are skipped
+    uint128 public minLiquidity;
+
+    /// @notice EMA of recent compound amounts for adaptive floor calculation
+    uint128 public trackedLiquidity;
+
+    /// @notice Protocol-set minimum floor that minLiquidity can never fall below
+    uint128 public immutable ABSOLUTE_FLOOR;
+
+    /// @notice EMA weight for historical data (90 = 90% historical, 10% new sample)
+    uint256 public constant EMA_ALPHA = 90;
+
+    /// @notice Ratio used to calculate minLiquidity from trackedLiquidity (95 = 95%)
+    uint256 public constant MIN_LIQ_RATIO = 95;
+
     // ============ Constructor ============
 
     /// @notice Creates a new AutoCompoundPositionHook
@@ -71,6 +86,7 @@ contract AutoCompoundPositionHook is BaseHook, Ownable, IAutoCompoundPositionHoo
     /// @param _salt Salt for position uniqueness
     /// @param _thresholdTokenIndex Which token for threshold (0 or 1)
     /// @param _thresholdAmount Minimum balance to trigger compounding
+    /// @param _absoluteFloor Protocol-set minimum floor for minLiquidity
     constructor(
         IPoolManager _poolManager,
         PoolKey memory poolKey_,
@@ -78,7 +94,8 @@ contract AutoCompoundPositionHook is BaseHook, Ownable, IAutoCompoundPositionHoo
         int24 _tickUpper,
         bytes32 _salt,
         uint256 _thresholdTokenIndex,
-        uint256 _thresholdAmount
+        uint256 _thresholdAmount,
+        uint128 _absoluteFloor
     ) BaseHook(_poolManager) Ownable(msg.sender) {
         require(_thresholdTokenIndex == 0 || _thresholdTokenIndex == 1, "bad threshold index");
         require(_tickLower < _tickUpper, "bad ticks");
@@ -93,6 +110,10 @@ contract AutoCompoundPositionHook is BaseHook, Ownable, IAutoCompoundPositionHoo
 
         thresholdTokenIndex = _thresholdTokenIndex;
         thresholdAmount = _thresholdAmount;
+
+        ABSOLUTE_FLOOR = _absoluteFloor;
+        minLiquidity = _absoluteFloor;
+        trackedLiquidity = _absoluteFloor;
     }
 
     // ============ View Functions ============
@@ -320,6 +341,12 @@ contract AutoCompoundPositionHook is BaseHook, Ownable, IAutoCompoundPositionHoo
 
         if (liq == 0) return;
 
+        // MEV floor check: skip compound if liquidity is below the dynamic floor
+        if (liq < minLiquidity) {
+            emit CompoundSkipped(liq, minLiquidity);
+            return;
+        }
+
         (BalanceDelta d,) = poolManager.modifyLiquidity(
             _poolKey,
             ModifyLiquidityParams({
@@ -334,7 +361,35 @@ contract AutoCompoundPositionHook is BaseHook, Ownable, IAutoCompoundPositionHoo
         // Settle what we owe (negative deltas)
         _settleNegativeDelta(d);
 
+        // Update EMA with balance-based fair estimate (post-compound balances)
+        uint128 fairLiq = _estimateFairLiquidity();
+        _updateTrackedLiquidity(fairLiq);
+
         emit Compounded(req0, req1, liq);
+    }
+
+    /// @notice Estimates fair liquidity using the midpoint tick and hook balances
+    /// @dev Uses the geometric mean of tick bounds (midTick) as a price-independent reference
+    ///      point, making this resistant to spot price manipulation
+    /// @return The estimated fair liquidity amount
+    function _estimateFairLiquidity() internal view returns (uint128) {
+        int24 midTick = (tickLower + tickUpper) / 2;
+        uint160 refSqrtPrice = TickMath.getSqrtPriceAtTick(midTick);
+        uint160 sqrtA = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtB = TickMath.getSqrtPriceAtTick(tickUpper);
+        uint256 bal0 = _balanceOf(_poolKey.currency0);
+        uint256 bal1 = _balanceOf(_poolKey.currency1);
+        return LiquidityAmounts.getLiquidityForAmounts(refSqrtPrice, sqrtA, sqrtB, bal0, bal1);
+    }
+
+    /// @notice Updates the tracked liquidity EMA and recalculates minLiquidity
+    /// @param newSample The new liquidity sample to incorporate into the EMA
+    function _updateTrackedLiquidity(uint128 newSample) internal {
+        trackedLiquidity = uint128(
+            (uint256(trackedLiquidity) * EMA_ALPHA + uint256(newSample) * (100 - EMA_ALPHA)) / 100
+        );
+        uint128 calculated = uint128(uint256(trackedLiquidity) * MIN_LIQ_RATIO / 100);
+        minLiquidity = calculated > ABSOLUTE_FLOOR ? calculated : ABSOLUTE_FLOOR;
     }
 
     /// @notice Returns the balance of a currency held by this contract

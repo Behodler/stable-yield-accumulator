@@ -44,6 +44,11 @@ interface IAutoCompoundPositionHook {
     /// @param amount1 Amount of token1 withdrawn
     event LiquidityWithdrawn(address indexed recipient, uint128 liquidityRemoved, uint256 amount0, uint256 amount1);
 
+    /// @notice Emitted when a compound attempt is skipped because calculated liquidity is below the floor
+    /// @param calculatedLiquidity The liquidity that would have been added
+    /// @param currentMinLiquidity The current minimum liquidity floor
+    event CompoundSkipped(uint128 calculatedLiquidity, uint128 currentMinLiquidity);
+
     // ============ State Variable Getters ============
 
     /// @notice Returns the pool key this hook is bound to
@@ -94,6 +99,26 @@ interface IAutoCompoundPositionHook {
     /// @notice Returns the salt used for the hook's position
     /// @return The position salt
     function positionSalt() external view returns (bytes32);
+
+    /// @notice Returns the current dynamic minimum liquidity floor
+    /// @return The minimum liquidity required for a compound to proceed
+    function minLiquidity() external view returns (uint128);
+
+    /// @notice Returns the EMA-tracked liquidity used for adaptive floor calculation
+    /// @return The current tracked liquidity EMA value
+    function trackedLiquidity() external view returns (uint128);
+
+    /// @notice Returns the protocol-set absolute minimum floor
+    /// @return The immutable absolute floor that minLiquidity can never fall below
+    function ABSOLUTE_FLOOR() external view returns (uint128);
+
+    /// @notice Returns the EMA weight for historical data (percentage)
+    /// @return The EMA alpha value (e.g., 90 = 90% historical weight)
+    function EMA_ALPHA() external view returns (uint256);
+
+    /// @notice Returns the ratio used to derive minLiquidity from trackedLiquidity (percentage)
+    /// @return The minimum liquidity ratio (e.g., 95 = 95% of tracked)
+    function MIN_LIQ_RATIO() external view returns (uint256);
 
     // ============ Owner Functions ============
 
