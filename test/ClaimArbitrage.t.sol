@@ -60,6 +60,7 @@ contract MockWETH is ERC20 {
  * @dev Simulates claim by:
  *   1. Pulling rewardToken from the caller (using transferFrom)
  *   2. Sending stablecoins to the caller
+ *   Also supports strategyTokens() and getYieldStrategies() for validation testing.
  */
 contract MockSYA {
     address public rewardToken;
@@ -68,6 +69,12 @@ contract MockSYA {
     uint256[] public yieldAmounts;    // amounts claimer receives
 
     uint256 public claimCallCount;
+
+    /// @notice Registered yield strategies
+    address[] internal _yieldStrategies;
+
+    /// @notice Mapping from strategy address to its underlying token
+    mapping(address => address) public strategyTokens;
 
     constructor(address _rewardToken) {
         rewardToken = _rewardToken;
@@ -81,6 +88,38 @@ contract MockSYA {
         claimPayment = _claimPayment;
         yieldTokens = _yieldTokens;
         yieldAmounts = _yieldAmounts;
+    }
+
+    /**
+     * @notice Register a yield strategy with its underlying token
+     * @param strategy The strategy address
+     * @param token The underlying token address for this strategy
+     */
+    function addYieldStrategy(address strategy, address token) external {
+        _yieldStrategies.push(strategy);
+        strategyTokens[strategy] = token;
+    }
+
+    /**
+     * @notice Remove a yield strategy
+     * @param strategy The strategy address to remove
+     */
+    function removeYieldStrategy(address strategy) external {
+        for (uint256 i = 0; i < _yieldStrategies.length; i++) {
+            if (_yieldStrategies[i] == strategy) {
+                _yieldStrategies[i] = _yieldStrategies[_yieldStrategies.length - 1];
+                _yieldStrategies.pop();
+                delete strategyTokens[strategy];
+                return;
+            }
+        }
+    }
+
+    /**
+     * @notice Get all registered yield strategies
+     */
+    function getYieldStrategies() external view returns (address[] memory) {
+        return _yieldStrategies;
     }
 
     function claim() external {
@@ -481,6 +520,7 @@ contract ClaimArbitrageTest is Test {
     event KnownStableAdded(address indexed stable);
     event KnownStableRemoved(address indexed stable);
     event PoolKeysUpdated();
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
 
     function setUp() public {
         owner = address(this);
@@ -571,6 +611,11 @@ contract ClaimArbitrageTest is Test {
         arb.addKnownStable(address(dai));
         arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
         arb.setStableToUSDCPool(address(dai), DAI_USDC_key);
+
+        // Register strategies in MockSYA so _validateKnownStablesCoverage() passes.
+        // Each strategy maps to a token that must be in knownStables[].
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
 
         // Configure SYA: claimer pays 90 USDC, gets 50 USDT + 50 DAI
         address[] memory yieldTokens = new address[](2);
@@ -739,6 +784,7 @@ contract ClaimArbitrageTest is Test {
         // Setup where claim yields only slightly more than cost
         arb.addKnownStable(address(usdt));
         arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         // Claimer pays 99 USDC, gets 100 USDT (only 1 USDC profit before slippage)
         address[] memory yieldTokens = new address[](1);
@@ -820,6 +866,7 @@ contract ClaimArbitrageTest is Test {
 
         arb.addKnownStable(address(usdt));
         arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         address[] memory yieldTokens = new address[](1);
         yieldTokens[0] = address(usdt);
@@ -857,6 +904,7 @@ contract ClaimArbitrageTest is Test {
         // Setup scenario where pump/unwind creates sUSDS shortfall
         arb.addKnownStable(address(usdt));
         arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         address[] memory yieldTokens = new address[](1);
         yieldTokens[0] = address(usdt);
@@ -1018,5 +1066,259 @@ contract ClaimArbitrageTest is Test {
         arb.execute(params);
 
         assertEq(sya.claimCallCount(), 1, "claim should have been called");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    RESCUE TOKEN TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_rescueToken_HappyPath() public {
+        // Strand some tokens in the arb contract
+        uint256 rescueAmount = 100e18;
+        usdt.mint(address(arb), rescueAmount);
+        address recipient = makeAddr("rescueRecipient");
+
+        uint256 recipientBefore = usdt.balanceOf(recipient);
+        arb.rescueToken(address(usdt), recipient, rescueAmount);
+        uint256 recipientAfter = usdt.balanceOf(recipient);
+
+        assertEq(recipientAfter - recipientBefore, rescueAmount, "Recipient should receive rescued tokens");
+        assertEq(usdt.balanceOf(address(arb)), 0, "Arb should have 0 remaining");
+    }
+
+    function test_rescueToken_RevertsIfNotOwner() public {
+        usdt.mint(address(arb), 100e18);
+        address notOwner = makeAddr("notOwner");
+
+        vm.prank(notOwner);
+        vm.expectRevert();
+        arb.rescueToken(address(usdt), notOwner, 100e18);
+    }
+
+    function test_rescueToken_RevertsIfZeroAddressRecipient() public {
+        usdt.mint(address(arb), 100e18);
+
+        vm.expectRevert(IClaimArbitrage.InvalidRecipient.selector);
+        arb.rescueToken(address(usdt), address(0), 100e18);
+    }
+
+    function test_rescueToken_EmitsTokenRescuedEvent() public {
+        uint256 rescueAmount = 42e18;
+        usdt.mint(address(arb), rescueAmount);
+        address recipient = makeAddr("rescueRecipient");
+
+        vm.expectEmit(true, true, false, true);
+        emit TokenRescued(address(usdt), recipient, rescueAmount);
+        arb.rescueToken(address(usdt), recipient, rescueAmount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    VALIDATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_validateKnownStablesCoverage_PassesWithExactMatch() public {
+        // knownStables = {USDT, DAI}, SYA strategies = {USDT, DAI}
+        arb.addKnownStable(address(usdt));
+        arb.addKnownStable(address(dai));
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        // Should not revert
+        arb.validateKnownStablesCoverage();
+    }
+
+    function test_validateKnownStablesCoverage_PassesWithSuperset() public {
+        // knownStables = {USDT, DAI, USDC}, SYA strategies = {USDT, DAI}
+        // knownStables is a superset — extra entries are fine
+        arb.addKnownStable(address(usdt));
+        arb.addKnownStable(address(dai));
+        arb.addKnownStable(address(usdc));
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        // Should not revert
+        arb.validateKnownStablesCoverage();
+    }
+
+    function test_validateKnownStablesCoverage_RevertsWhenStrategyTokenMissing() public {
+        // knownStables = {USDT}, SYA strategies = {USDT, DAI}
+        // DAI is missing from knownStables → should revert
+        arb.addKnownStable(address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        vm.expectRevert(abi.encodeWithSelector(IClaimArbitrage.StrategyTokenNotInKnownStables.selector, address(dai)));
+        arb.validateKnownStablesCoverage();
+    }
+
+    function test_validation_M01Scenario_ExecuteRevertsWithUnregisteredToken() public {
+        // Full M-01 scenario: SYA has a strategy token (DAI) that is NOT in knownStables[].
+        // execute() should revert instead of silently locking the DAI tokens.
+        arb.addKnownStable(address(usdt));
+        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+
+        // Register strategies: USDT (covered) + DAI (NOT covered)
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        // Configure SYA claim
+        address[] memory yieldTokens = new address[](2);
+        yieldTokens[0] = address(usdt);
+        yieldTokens[1] = address(dai);
+        uint256[] memory yieldAmounts = new uint256[](2);
+        yieldAmounts[0] = 50e18;
+        yieldAmounts[1] = 50e18;
+        sya.setupClaim(90e18, yieldTokens, yieldAmounts);
+        usdt.mint(address(sya), 50e18);
+        dai.mint(address(sya), 50e18);
+
+        IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            usdcNeeded: 90e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+
+        // execute() should revert because DAI is not in knownStables[]
+        vm.prank(caller);
+        vm.expectRevert(abi.encodeWithSelector(IClaimArbitrage.StrategyTokenNotInKnownStables.selector, address(dai)));
+        arb.execute(params);
+    }
+
+    function test_validation_M01Scenario_ExecuteSucceedsAfterAddingMissingStable() public {
+        // Same as above, but after adding DAI to knownStables[], execute() succeeds.
+        arb.addKnownStable(address(usdt));
+        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+
+        // Register strategies: USDT + DAI
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        // Configure SYA claim
+        address[] memory yieldTokens = new address[](2);
+        yieldTokens[0] = address(usdt);
+        yieldTokens[1] = address(dai);
+        uint256[] memory yieldAmounts = new uint256[](2);
+        yieldAmounts[0] = 50e18;
+        yieldAmounts[1] = 50e18;
+        sya.setupClaim(90e18, yieldTokens, yieldAmounts);
+        usdt.mint(address(sya), 50e18);
+        dai.mint(address(sya), 50e18);
+
+        // Now add the missing DAI stable and its pool mapping
+        arb.addKnownStable(address(dai));
+        arb.setStableToUSDCPool(address(dai), DAI_USDC_key);
+
+        IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            usdcNeeded: 90e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+
+        // execute() should succeed now
+        vm.prank(caller);
+        arb.execute(params);
+
+        assertEq(sya.claimCallCount(), 1, "claim should have been called");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    STEP 5 REWARD TOKEN TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_step5_RewardTokenDepositedButNotSwapped() public {
+        // Scenario: USDC is both the reward token AND a strategy token in knownStables[].
+        // It should be deposited into PM but NOT swapped (skip the swap call).
+        // We verify this by checking the swap call count.
+
+        // Register USDC as a known stable (it's the reward token)
+        arb.addKnownStable(address(usdc));
+        arb.addKnownStable(address(usdt));
+        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+
+        // Register strategies: one produces USDT, one produces USDC (the reward token)
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+        sya.addYieldStrategy(makeAddr("strategyUSDC"), address(usdc));
+
+        // Configure claim: pays 80 USDC, gets 50 USDT + 50 USDC
+        address[] memory yieldTokens = new address[](2);
+        yieldTokens[0] = address(usdt);
+        yieldTokens[1] = address(usdc);
+        uint256[] memory yieldAmounts = new uint256[](2);
+        yieldAmounts[0] = 50e18;
+        yieldAmounts[1] = 50e18;
+        sya.setupClaim(80e18, yieldTokens, yieldAmounts);
+        usdt.mint(address(sya), 50e18);
+        usdc.mint(address(sya), 50e18);
+
+        IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            usdcNeeded: 80e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+
+        uint256 swapCountBefore = pm.swapCallCount();
+
+        vm.prank(caller);
+        arb.execute(params);
+
+        uint256 swapCountAfter = pm.swapCallCount();
+
+        // Expected swaps:
+        //   Step 1: pump (1 swap)
+        //   Step 4: unwind (1 swap)
+        //   Step 5: USDT->USDC swap (1 swap), USDC skipped (0 swaps)
+        //   Step 7: USDC->WETH swap (1 swap)
+        // Total: 4 swaps (NOT 5, because USDC was skipped)
+        //
+        // If USDC were NOT skipped, we'd see 5 swaps. With the skip,
+        // only USDT gets swapped in Step 5.
+        uint256 actualSwaps = swapCountAfter - swapCountBefore;
+
+        // Without the reward token skip, there would be an extra swap.
+        // The exact count depends on whether sUSDS residual delta triggers a swap.
+        // With 1:1 default swaps, sUSDS delta nets to 0 (no step 6 swap needed).
+        // phUSD residual delta check doesn't trigger with 1:1 swaps.
+        // So expected: pump(1) + unwind(1) + USDT_swap(1) + USDC_WETH(1) = 4
+        assertEq(actualSwaps, 4, "Should have 4 swaps (USDC reward token skipped in Step 5)");
+    }
+
+    function test_step5_RewardTokenNotInStrategies_SkippedDueToZeroBalance() public {
+        // Scenario: USDC is in knownStables[] (as reward token) but NOT distributed by SYA
+        // as a strategy yield. Its balance should be 0 after claim payment, so it's
+        // skipped by the `if (bal == 0) continue;` check.
+
+        // knownStables = {USDT, USDC}, but SYA only distributes USDT
+        arb.addKnownStable(address(usdt));
+        arb.addKnownStable(address(usdc));
+        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+
+        // Only USDT strategy registered (validation only cares about SYA→knownStables direction)
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
+
+        // Configure claim: pays 90 USDC, gets 100 USDT (no USDC yield)
+        address[] memory yieldTokens = new address[](1);
+        yieldTokens[0] = address(usdt);
+        uint256[] memory yieldAmounts = new uint256[](1);
+        yieldAmounts[0] = 100e18;
+        sya.setupClaim(90e18, yieldTokens, yieldAmounts);
+        usdt.mint(address(sya), 100e18);
+
+        IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            usdcNeeded: 90e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+
+        vm.prank(caller);
+        arb.execute(params);
+
+        // Success: USDC in knownStables was harmless — had 0 balance, was skipped.
+        // USDT was swapped normally. Caller received ETH profit.
+        assertTrue(caller.balance > 0, "Caller should receive ETH profit");
+        assertEq(usdt.balanceOf(address(arb)), 0, "No residual USDT");
     }
 }

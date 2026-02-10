@@ -144,6 +144,30 @@ Use these as slash commands (e.g., `/add-mutable-dependency`) or run the scripts
 - `forge fmt` - Format Solidity code
 - `forge snapshot` - Generate gas snapshots
 
+## ClaimArbitrage Reward Token Accounting
+
+### Why the Reward Token Gets Special Treatment in Step 5
+
+ClaimArbitrage's Step 5 iterates `knownStables[]` to convert each received stablecoin into USDC via a Uniswap V4 swap. However, when SYA's reward token (currently USDC) is itself a strategy token -- meaning a yield strategy distributes USDC -- the contract must skip the swap for that token. Swapping USDC to USDC is nonsensical (no self-referential pool exists), and the deposit into PoolManager alone already creates the correct positive delta. The reward token is already the target denomination, so no conversion is needed.
+
+### Delta Accounting Flow
+
+The flash-borrowed token for the price pump is sUSDS (not USDC). USDC is `take()`-n from PoolManager in Step 2 to pay for the SYA `claim()` call. After claim(), ClaimArbitrage's real USDC balance is:
+
+```
+usdcBorrowed - phlimboPayment + usdcFromStrategies
+```
+
+Depositing all of this back into PoolManager (via `_depositIntoPM`) creates a positive USDC delta. Combined with the negative delta from Step 2 and positive deltas from converting other stables to USDC, the net USDC delta equals the arbitrage profit. Step 7 then swaps this net USDC delta to WETH for profit extraction.
+
+### The One-Directional Invariant (Audit M-01)
+
+SYA's registered strategy tokens must be a subset of ClaimArbitrage's `knownStables[]`. The reverse is not required -- `knownStables[]` CAN contain tokens that SYA does not currently distribute (preemptive registration is fine). This invariant is enforced by `_validateKnownStablesCoverage()` which runs at the start of every `unlockCallback()`. If violated, the entire atomic operation reverts, preventing tokens from being silently locked in the contract.
+
+### Why `sya.rewardToken()` Is Used Dynamically
+
+Step 5 queries `sya.rewardToken()` to determine which token to skip, rather than using ClaimArbitrage's immutable `USDC` address. The reward token is conceptually a property of SYA, not of ClaimArbitrage. If SYA's reward token were ever reconfigured, ClaimArbitrage's logic must adapt automatically without redeployment. The immutable `USDC` in ClaimArbitrage represents what CA was initialized with; `sya.rewardToken()` represents what SYA currently expects.
+
 ## Important Reminders
 
 - This submodule operates independently from sibling submodules

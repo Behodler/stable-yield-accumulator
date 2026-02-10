@@ -59,6 +59,14 @@ interface IClaimArbitrage {
      */
     event PoolKeysUpdated();
 
+    /**
+     * @notice Emitted when stranded tokens are rescued from the contract
+     * @param token The rescued token address
+     * @param to The recipient of the rescued tokens
+     * @param amount The amount of tokens rescued
+     */
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
+
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -83,6 +91,17 @@ interface IClaimArbitrage {
      */
     error ETHTransferFailed();
 
+    /**
+     * @notice Thrown when a SYA strategy token is not present in knownStables[]
+     * @param token The strategy token address missing from knownStables[]
+     */
+    error StrategyTokenNotInKnownStables(address token);
+
+    /**
+     * @notice Thrown when rescue recipient is the zero address
+     */
+    error InvalidRecipient();
+
     /*//////////////////////////////////////////////////////////////
                             FUNCTIONS
     //////////////////////////////////////////////////////////////*/
@@ -92,4 +111,20 @@ interface IClaimArbitrage {
      * @param params The calibrated parameters for the arbitrage
      */
     function execute(ExecuteParams calldata params) external;
+
+    /**
+     * @notice Rescue stranded ERC20 tokens from the contract (owner-only safety net)
+     * @param token The ERC20 token to rescue
+     * @param to The recipient address
+     * @param amount The amount to rescue
+     */
+    function rescueToken(address token, address to, uint256 amount) external;
+
+    /**
+     * @notice Validates that every SYA strategy token is present in knownStables[]
+     * @dev Reverts with StrategyTokenNotInKnownStables if any strategy token is missing.
+     *      This is a one-directional check: knownStables[] CAN be a superset of SYA strategy
+     *      tokens, but SYA strategy tokens must never be absent from knownStables[].
+     */
+    function validateKnownStablesCoverage() external view;
 }
