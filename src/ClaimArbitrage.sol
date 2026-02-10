@@ -138,6 +138,14 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         (ExecuteParams memory p, address caller) = abi.decode(data, (ExecuteParams, address));
 
         // ──────────────────────────────────────────────────────────
+        // PRE-FLIGHT: VALIDATE KNOWN STABLES COVERAGE
+        // Ensure every SYA strategy token is in knownStables[] so Step 5 won't
+        // silently skip any distributed tokens. Reverting here inside the PM callback
+        // atomically unwinds all deltas — no tokens can be locked (audit M-01).
+        // ──────────────────────────────────────────────────────────
+        _validateKnownStablesCoverage();
+
+        // ──────────────────────────────────────────────────────────
         // STEP 1: PUMP phUSD PRICE ABOVE TARGET
         // Swap sUSDS -> phUSD in the phUSD/sUSDS pool.
         // This buys phUSD, pushing its spot price up past targetPrice.
@@ -191,14 +199,35 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         // For each stablecoin received from claim():
         //   1. Deposit tokens into PM (positive delta / credit)
         //   2. Swap stablecoin -> USDC within PM (adjusts deltas)
+        //
+        // Cache reward token to avoid repeated external calls in the loop.
+        // We query sya.rewardToken() rather than using the immutable USDC address because
+        // the reward token is a property of SYA, not of this contract. If SYA's reward token
+        // ever changes, this logic adapts automatically.
         // ──────────────────────────────────────────────────────────
+        address _rewardToken = sya.rewardToken();
+
         for (uint256 i = 0; i < knownStables.length; i++) {
             address stable = knownStables[i];
             uint256 bal = IERC20(stable).balanceOf(address(this));
             if (bal == 0) continue;
 
-            // Deposit into PM: transfer tokens then settle to get positive delta
+            // Deposit real tokens into PoolManager, creating positive delta for this token.
             _depositIntoPM(stable, bal);
+
+            // If this stable IS the reward token (e.g., USDC from a USDC-yielding strategy),
+            // skip the swap — it's already the target denomination. The deposit above already
+            // created the positive USDC delta we need. Attempting to swap reward->reward would
+            // require a non-existent self-referential pool and is nonsensical.
+            //
+            // Delta accounting recap for the reward token (USDC):
+            //   Step 2:  take(USDC, usdcNeeded)          -> negative USDC delta
+            //   Step 3:  claim() pays Phlimbo in USDC     -> real USDC leaves contract
+            //   Step 3:  claim() receives USDC from strategies -> real USDC enters contract
+            //   Step 5:  _depositIntoPM(USDC, balance)    -> positive USDC delta
+            //   Net:     positive delta = profit from strategies minus Phlimbo payment
+            //   Step 7:  swap net USDC delta -> WETH       -> profit extraction
+            if (stable == _rewardToken) continue;
 
             // Swap stable -> USDC (exact input)
             PoolKey memory pool = stableToUSDCPool[stable];
@@ -351,6 +380,56 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
             }),
             ""
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        RESCUE & VALIDATION
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Rescue stranded ERC20 tokens from the contract (audit M-01 mitigation A).
+     * @dev Safety net for any tokens that become trapped, regardless of cause.
+     *      Only callable by the contract owner.
+     * @param token The ERC20 token to rescue
+     * @param to The recipient address (must not be zero address)
+     * @param amount The amount to rescue
+     */
+    function rescueToken(address token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert InvalidRecipient();
+        IERC20(token).safeTransfer(to, amount);
+        emit TokenRescued(token, to, amount);
+    }
+
+    /// @dev Validates that every token SYA's yield strategies might distribute is present in
+    ///      knownStables[]. This is a one-directional check: knownStables CAN be a superset
+    ///      (CA may preemptively register tokens before SYA adds the strategy), but SYA strategy
+    ///      tokens must never be absent from knownStables, otherwise Step 5 would silently skip
+    ///      them and they'd be permanently locked in this contract (audit finding M-01).
+    ///
+    ///      Gas: O(n*m) where n = strategies, m = knownStables. Both arrays are expected to be
+    ///      small (single digits), so this is acceptable.
+    function _validateKnownStablesCoverage() internal view {
+        address[] memory strategies = sya.getYieldStrategies();
+        for (uint256 i = 0; i < strategies.length; i++) {
+            address token = sya.strategyTokens(strategies[i]);
+            bool found = false;
+            for (uint256 j = 0; j < knownStables.length; j++) {
+                if (knownStables[j] == token) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) revert StrategyTokenNotInKnownStables(token);
+        }
+    }
+
+    /**
+     * @notice Public wrapper for off-chain verification of strategy coverage.
+     * @dev Allows bots and monitoring to check if knownStables[] covers all SYA strategy tokens
+     *      before attempting execute(). Reverts with StrategyTokenNotInKnownStables if not.
+     */
+    function validateKnownStablesCoverage() external view {
+        _validateKnownStablesCoverage();
     }
 
     /*//////////////////////////////////////////////////////////////

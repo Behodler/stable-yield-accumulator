@@ -176,6 +176,13 @@ interface IStableYieldAccumulator {
      */
     function getYieldStrategies() external view returns (address[] memory);
 
+    /**
+     * @notice Gets the token address associated with a yield strategy
+     * @param strategy Address of the yield strategy
+     * @return Address of the token the strategy handles
+     */
+    function strategyTokens(address strategy) external view returns (address);
+
     /*//////////////////////////////////////////////////////////////
                         TOKEN CONFIGURATION
     //////////////////////////////////////////////////////////////*/
@@ -254,6 +261,12 @@ interface IStableYieldAccumulator {
     /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
     //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Gets the reward token address used for claim payments
+     * @return Address of the reward token (e.g., USDC)
+     */
+    function rewardToken() external view returns (address);
 
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
