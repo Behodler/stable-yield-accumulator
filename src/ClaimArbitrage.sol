@@ -1,0 +1,421 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {Currency} from "v4-core/types/Currency.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {SwapParams} from "v4-core/types/PoolOperation.sol";
+import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
+import {TransientStateLibrary} from "v4-core/libraries/TransientStateLibrary.sol";
+import "./interfaces/IClaimArbitrage.sol";
+import "./interfaces/IStableYieldAccumulator.sol";
+
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint256) external;
+}
+
+/**
+ * @title ClaimArbitrage
+ * @notice Atomically pumps phUSD price above targetPrice, calls claim() on StableYieldAccumulator
+ *         to capture discounted stablecoins, unwinds the price pump, converts profit to ETH,
+ *         and sends it to the caller. All operations use Uniswap V4 PoolManager's unlock/delta
+ *         accounting for flash liquidity -- no external flash loans needed.
+ * @dev Implements IUnlockCallback. The execute() entry point is permissionless so MEV bots can call it.
+ */
+contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
+    using SafeERC20 for IERC20;
+    using TransientStateLibrary for IPoolManager;
+
+    /*//////////////////////////////////////////////////////////////
+                            IMMUTABLES
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Uniswap V4 PoolManager singleton
+    IPoolManager public immutable poolManager;
+
+    /// @notice The StableYieldAccumulator to claim from
+    IStableYieldAccumulator public immutable sya;
+
+    /// @notice USDC token address
+    address public immutable USDC;
+
+    /// @notice WETH token address
+    address public immutable WETH;
+
+    /// @notice sUSDS token address
+    address public immutable sUSDS;
+
+    /// @notice phUSD token address
+    address public immutable phUSD;
+
+    /*//////////////////////////////////////////////////////////////
+                            STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Pool key for the phUSD/sUSDS pool (price manipulation + unwind)
+    PoolKey public phUSD_sUSDS_pool;
+
+    /// @notice Pool key for the USDC/WETH pool (profit conversion)
+    PoolKey public USDC_WETH_pool;
+
+    /// @notice Pool key for the sUSDS/USDC pool (slippage coverage)
+    PoolKey public sUSDS_USDC_pool;
+
+    /// @notice Mapping from stablecoin address to its USDC conversion pool
+    mapping(address => PoolKey) public stableToUSDCPool;
+
+    /// @notice Iterable list of stablecoins that claim() might yield
+    address[] public knownStables;
+
+    /// @notice Whether phUSD is token0 in the phUSD/sUSDS pool
+    bool public token0IsPhUSD;
+
+    /*//////////////////////////////////////////////////////////////
+                            CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Initialize the ClaimArbitrage contract
+     * @param _poolManager Uniswap V4 PoolManager address
+     * @param _sya StableYieldAccumulator address
+     * @param _usdc USDC token address
+     * @param _weth WETH token address
+     * @param _sUSDS sUSDS token address
+     * @param _phUSD phUSD token address
+     */
+    constructor(
+        address _poolManager,
+        address _sya,
+        address _usdc,
+        address _weth,
+        address _sUSDS,
+        address _phUSD
+    ) Ownable(msg.sender) {
+        poolManager = IPoolManager(_poolManager);
+        sya = IStableYieldAccumulator(_sya);
+        USDC = _usdc;
+        WETH = _weth;
+        sUSDS = _sUSDS;
+        phUSD = _phUSD;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            RECEIVE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Accept ETH from WETH unwrap
+    receive() external payable {}
+
+    /*//////////////////////////////////////////////////////////////
+                        ENTRY POINT
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Execute the atomic arbitrage. Permissionless.
+     * @param params Calibrated parameters for the arbitrage
+     */
+    function execute(ExecuteParams calldata params) external override {
+        poolManager.unlock(abi.encode(params, msg.sender));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    UNLOCK CALLBACK
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Called by PoolManager during unlock. Performs the 9-step atomic arbitrage.
+     * @param data ABI-encoded (ExecuteParams, caller address)
+     * @return Empty bytes on success
+     */
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
+
+        (ExecuteParams memory p, address caller) = abi.decode(data, (ExecuteParams, address));
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 1: PUMP phUSD PRICE ABOVE TARGET
+        // Swap sUSDS -> phUSD in the phUSD/sUSDS pool.
+        // This buys phUSD, pushing its spot price up past targetPrice.
+        // ──────────────────────────────────────────────────────────
+        bool sellingToken0 = token0IsPhUSD ? false : true; // sell sUSDS side
+        BalanceDelta pumpDelta = poolManager.swap(
+            phUSD_sUSDS_pool,
+            SwapParams({
+                zeroForOne: sellingToken0,
+                amountSpecified: -int256(p.pumpAmount), // negative = exact input
+                sqrtPriceLimitX96: p.pumpPriceLimit
+            }),
+            ""
+        );
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 2: BORROW USDC (flash)
+        // take() sends actual USDC tokens to this contract
+        // and records a negative USDC delta (debt).
+        // ──────────────────────────────────────────────────────────
+        poolManager.take(Currency.wrap(USDC), address(this), p.usdcNeeded);
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 3: CALL CLAIM
+        // phUSD price is now above the floor -> claim() succeeds.
+        // We pay usdcNeeded USDC (discounted), receive full-value
+        // mixed stablecoins as real ERC20 tokens.
+        // ──────────────────────────────────────────────────────────
+        IERC20(USDC).approve(address(sya), p.usdcNeeded);
+        sya.claim();
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 4: UNWIND PRICE PUMP
+        // Sell all phUSD back for sUSDS in the same pool.
+        // Resolves most of the phUSD/sUSDS deltas from Step 1.
+        // ──────────────────────────────────────────────────────────
+        uint256 phUSD_toSell = _absDelta(pumpDelta, token0IsPhUSD);
+
+        poolManager.swap(
+            phUSD_sUSDS_pool,
+            SwapParams({
+                zeroForOne: !sellingToken0, // selling phUSD side now
+                amountSpecified: -int256(phUSD_toSell), // exact input: sell all phUSD
+                sqrtPriceLimitX96: p.unwindPriceLimit
+            }),
+            ""
+        );
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 5: CONVERT RECEIVED STABLECOINS -> USDC
+        // For each stablecoin received from claim():
+        //   1. Deposit tokens into PM (positive delta / credit)
+        //   2. Swap stablecoin -> USDC within PM (adjusts deltas)
+        // ──────────────────────────────────────────────────────────
+        for (uint256 i = 0; i < knownStables.length; i++) {
+            address stable = knownStables[i];
+            uint256 bal = IERC20(stable).balanceOf(address(this));
+            if (bal == 0) continue;
+
+            // Deposit into PM: transfer tokens then settle to get positive delta
+            _depositIntoPM(stable, bal);
+
+            // Swap stable -> USDC (exact input)
+            PoolKey memory pool = stableToUSDCPool[stable];
+            bool stableIsToken0 = (Currency.unwrap(pool.currency0) == stable);
+            poolManager.swap(
+                pool,
+                SwapParams({
+                    zeroForOne: stableIsToken0,
+                    amountSpecified: -int256(bal),
+                    sqrtPriceLimitX96: stableIsToken0
+                        ? type(uint160).min + 1 // selling token0, price goes down
+                        : type(uint160).max - 1 // selling token1, price goes up
+                }),
+                ""
+            );
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 6: COVER sUSDS ROUND-TRIP SLIPPAGE COST
+        // If we still have negative sUSDS delta from pump/unwind,
+        // buy a tiny amount of sUSDS with USDC to zero it out.
+        // ──────────────────────────────────────────────────────────
+        int256 sUSDSDelta = poolManager.currencyDelta(address(this), Currency.wrap(sUSDS));
+        if (sUSDSDelta < 0) {
+            uint256 sUSDS_owed = uint256(-sUSDSDelta);
+            bool sUSDS_isToken0 = (Currency.unwrap(sUSDS_USDC_pool.currency0) == sUSDS);
+
+            // Buy exact output of sUSDS_owed using USDC
+            poolManager.swap(
+                sUSDS_USDC_pool,
+                SwapParams({
+                    zeroForOne: !sUSDS_isToken0, // selling USDC side
+                    amountSpecified: int256(sUSDS_owed), // positive = exact output
+                    sqrtPriceLimitX96: !sUSDS_isToken0
+                        ? type(uint160).min + 1
+                        : type(uint160).max - 1
+                }),
+                ""
+            );
+        }
+
+        // Settle any residual phUSD delta the same way
+        _settleResidualDelta(phUSD);
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 7: CONVERT USDC PROFIT TO WETH
+        // Remaining positive USDC delta = profit minus costs.
+        // Swap all of it to WETH.
+        // ──────────────────────────────────────────────────────────
+        int256 usdcProfit = poolManager.currencyDelta(address(this), Currency.wrap(USDC));
+        if (usdcProfit <= 0) revert NoProfit();
+
+        bool usdcIsToken0 = (Currency.unwrap(USDC_WETH_pool.currency0) == USDC);
+        poolManager.swap(
+            USDC_WETH_pool,
+            SwapParams({
+                zeroForOne: usdcIsToken0,
+                amountSpecified: -int256(uint256(usdcProfit)), // exact input: sell all USDC
+                sqrtPriceLimitX96: usdcIsToken0
+                    ? type(uint160).min + 1
+                    : type(uint160).max - 1
+            }),
+            ""
+        );
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 8: EXTRACT WETH PROFIT
+        // take() converts positive WETH delta into actual WETH tokens.
+        // ──────────────────────────────────────────────────────────
+        int256 wethDelta = poolManager.currencyDelta(address(this), Currency.wrap(WETH));
+        if (wethDelta <= 0) revert NoWETHProfit();
+
+        uint256 profit = uint256(wethDelta);
+        poolManager.take(Currency.wrap(WETH), address(this), profit);
+
+        // ──────────────────────────────────────────────────────────
+        // STEP 9: UNWRAP WETH -> ETH AND SEND TO CALLER
+        // ──────────────────────────────────────────────────────────
+        IWETH(WETH).withdraw(profit);
+        (bool ok,) = caller.call{value: profit}("");
+        if (!ok) revert ETHTransferFailed();
+
+        emit ArbitrageExecuted(caller, profit);
+
+        return "";
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Deposit ERC20 tokens into PoolManager, creating a positive (credit) delta.
+     *      Pattern: sync -> transfer -> settle
+     * @param token The token to deposit
+     * @param amount The amount to deposit
+     */
+    function _depositIntoPM(address token, uint256 amount) internal {
+        poolManager.sync(Currency.wrap(token));
+        IERC20(token).safeTransfer(address(poolManager), amount);
+        poolManager.settle();
+    }
+
+    /**
+     * @dev Extract the absolute amount for one side of a BalanceDelta
+     * @param delta The balance delta from a swap
+     * @param useToken0 Whether to extract the token0 amount
+     * @return The absolute value of the specified side
+     */
+    function _absDelta(BalanceDelta delta, bool useToken0) internal pure returns (uint256) {
+        int128 raw = useToken0 ? delta.amount0() : delta.amount1();
+        return raw > 0 ? uint256(uint128(raw)) : uint256(uint128(-raw));
+    }
+
+    /**
+     * @dev If a currency has residual negative delta, buy it with USDC to zero it out
+     * @param token The token to check and settle
+     */
+    function _settleResidualDelta(address token) internal {
+        int256 d = poolManager.currencyDelta(address(this), Currency.wrap(token));
+        if (d >= 0) return;
+
+        // Need to buy `token` with USDC
+        // Use the stableToUSDCPool mapping if available, otherwise use sUSDS_USDC_pool
+        PoolKey memory pool = stableToUSDCPool[token];
+        // If pool is not configured for this token, check if it's sUSDS
+        if (Currency.unwrap(pool.currency0) == address(0) && Currency.unwrap(pool.currency1) == address(0)) {
+            // For sUSDS, use the dedicated pool
+            if (token == sUSDS) {
+                pool = sUSDS_USDC_pool;
+            } else {
+                // For phUSD, use phUSD/sUSDS pool with an intermediary step
+                // In practice, residual phUSD delta should be negligible after unwind
+                return;
+            }
+        }
+
+        uint256 owed = uint256(-d);
+        bool tokenIsToken0 = (Currency.unwrap(pool.currency0) == token);
+
+        // Buy exact output of owed amount
+        poolManager.swap(
+            pool,
+            SwapParams({
+                zeroForOne: !tokenIsToken0, // selling the other side (USDC)
+                amountSpecified: int256(owed), // positive = exact output
+                sqrtPriceLimitX96: !tokenIsToken0
+                    ? type(uint160).min + 1
+                    : type(uint160).max - 1
+            }),
+            ""
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        OWNER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Set the pool key mapping for a stablecoin to USDC conversion
+     * @param stable The stablecoin address
+     * @param pool The PoolKey for the stable/USDC pool
+     */
+    function setStableToUSDCPool(address stable, PoolKey calldata pool) external onlyOwner {
+        stableToUSDCPool[stable] = pool;
+        emit StableToUSDCPoolSet(stable);
+    }
+
+    /**
+     * @notice Add a stablecoin to the known stables list
+     * @param stable The stablecoin address to add
+     */
+    function addKnownStable(address stable) external onlyOwner {
+        knownStables.push(stable);
+        emit KnownStableAdded(stable);
+    }
+
+    /**
+     * @notice Remove a stablecoin from the known stables list
+     * @param stable The stablecoin address to remove
+     */
+    function removeKnownStable(address stable) external onlyOwner {
+        for (uint256 i = 0; i < knownStables.length; i++) {
+            if (knownStables[i] == stable) {
+                knownStables[i] = knownStables[knownStables.length - 1];
+                knownStables.pop();
+                emit KnownStableRemoved(stable);
+                return;
+            }
+        }
+    }
+
+    /**
+     * @notice Set the pool keys for the three main pools and the token ordering flag
+     * @param _phUSD_sUSDS_pool Pool key for phUSD/sUSDS
+     * @param _USDC_WETH_pool Pool key for USDC/WETH
+     * @param _sUSDS_USDC_pool Pool key for sUSDS/USDC
+     * @param _token0IsPhUSD Whether phUSD is token0 in the phUSD/sUSDS pool
+     */
+    function setPoolKeys(
+        PoolKey calldata _phUSD_sUSDS_pool,
+        PoolKey calldata _USDC_WETH_pool,
+        PoolKey calldata _sUSDS_USDC_pool,
+        bool _token0IsPhUSD
+    ) external onlyOwner {
+        phUSD_sUSDS_pool = _phUSD_sUSDS_pool;
+        USDC_WETH_pool = _USDC_WETH_pool;
+        sUSDS_USDC_pool = _sUSDS_USDC_pool;
+        token0IsPhUSD = _token0IsPhUSD;
+        emit PoolKeysUpdated();
+    }
+
+    /**
+     * @notice Get all known stablecoins
+     * @return Array of known stablecoin addresses
+     */
+    function getKnownStables() external view returns (address[] memory) {
+        return knownStables;
+    }
+}
