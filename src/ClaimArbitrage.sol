@@ -269,8 +269,12 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
             );
         }
 
-        // Settle any residual phUSD delta the same way
+        // Step 6b: Settle any residual phUSD delta via phUSD/sUSDS pool
         _settleResidualDelta(phUSD);
+        // Step 6c: Settle secondary sUSDS residual from phUSD settlement.
+        // The phUSD→sUSDS swap above creates a new sUSDS delta that must be settled
+        // via sUSDS_USDC_pool. The resulting USDC delta feeds into Step 7's profit conversion.
+        _settleResidualDelta(sUSDS);
 
         // ──────────────────────────────────────────────────────────
         // STEP 7: CONVERT USDC PROFIT TO WETH
@@ -343,25 +347,36 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
     }
 
     /**
-     * @dev If a currency has residual negative delta, buy it with USDC to zero it out
+     * @dev If a currency has residual delta (positive or negative), settle it to zero.
+     *      - Zero delta: no-op.
+     *      - Positive delta: take excess tokens from PM, then re-deposit them to zero the delta.
+     *      - Negative delta: buy the owed amount via the configured pool (stableToUSDCPool,
+     *        sUSDS_USDC_pool, or phUSD_sUSDS_pool fallback).
      * @param token The token to check and settle
      */
     function _settleResidualDelta(address token) internal {
         int256 d = poolManager.currencyDelta(address(this), Currency.wrap(token));
-        if (d >= 0) return;
+        if (d == 0) return;
 
-        // Need to buy `token` with USDC
-        // Use the stableToUSDCPool mapping if available, otherwise use sUSDS_USDC_pool
+        if (d > 0) {
+            // Positive delta: the contract has a credit in PoolManager.
+            // take() converts the credit into real tokens, zeroing the delta.
+            // The tokens remain in the contract and can be used in subsequent
+            // operations or rescued via rescueToken().
+            poolManager.take(Currency.wrap(token), address(this), uint256(d));
+            return;
+        }
+
+        // Negative delta: need to buy `token` to zero the debt.
+        // Use the stableToUSDCPool mapping if available, otherwise use hardcoded fallbacks.
         PoolKey memory pool = stableToUSDCPool[token];
-        // If pool is not configured for this token, check if it's sUSDS
         if (Currency.unwrap(pool.currency0) == address(0) && Currency.unwrap(pool.currency1) == address(0)) {
-            // For sUSDS, use the dedicated pool
             if (token == sUSDS) {
                 pool = sUSDS_USDC_pool;
+            } else if (token == phUSD) {
+                pool = phUSD_sUSDS_pool;
             } else {
-                // For phUSD, use phUSD/sUSDS pool with an intermediary step
-                // In practice, residual phUSD delta should be negligible after unwind
-                return;
+                revert UnsettledResidualForUnconfiguredToken(token);
             }
         }
 
@@ -372,7 +387,7 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         poolManager.swap(
             pool,
             SwapParams({
-                zeroForOne: !tokenIsToken0, // selling the other side (USDC)
+                zeroForOne: !tokenIsToken0, // selling the other side
                 amountSpecified: int256(owed), // positive = exact output
                 sqrtPriceLimitX96: !tokenIsToken0
                     ? type(uint160).min + 1
