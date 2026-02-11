@@ -136,11 +136,6 @@ interface IStableYieldAccumulator {
     error InsufficientPending();
 
     /**
-     * @notice Thrown when a token is paused and an operation is attempted
-     */
-    error TokenIsPaused();
-
-    /**
      * @notice Thrown when trying to claim zero amount
      */
     error ZeroAmount();

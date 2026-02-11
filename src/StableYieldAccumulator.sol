@@ -586,7 +586,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             address token = strategyTokens[strategy];
             if (token == address(0)) continue;
 
-            if (tokenConfigs[token].paused) revert TokenIsPaused();
+            if (tokenConfigs[token].paused) continue;
 
             uint256 yield = _getYieldForStrategy(strategy, token);
             if (yield > 0) {

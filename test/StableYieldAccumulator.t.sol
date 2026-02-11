@@ -810,14 +810,14 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.claim();
     }
 
-    function test_claim_RevertIf_TokenPaused() public {
+    function test_claim_RevertIf_AllTokensPaused() public {
         address claimer = _setupClaimScenario(100e18);
 
-        // Pause the strategy token
+        // Pause the only strategy token — claim skips it, yielding zero total
         accumulator.pauseToken(address(strategyToken1));
 
         vm.prank(claimer);
-        vm.expectRevert(IStableYieldAccumulator.TokenIsPaused.selector);
+        vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
         accumulator.claim();
     }
 
@@ -1246,6 +1246,163 @@ contract StableYieldAccumulatorTest is Test {
 
         assertEq(individualUsdcYield, usdcYield, "getYield for USDC strategy should return native 6-decimal value");
         assertEq(individualDolaYield, dolaYield, "getYield for DOLA strategy should return native 18-decimal value");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    PAUSED TOKEN CLAIM CONSISTENCY TESTS (M-02)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice claim() succeeds when one strategy's token is paused,
+    ///         collecting yield only from the unpaused strategy.
+    function test_claim_SucceedsWithOnePausedToken() public {
+        address claimer = makeAddr("claimer");
+
+        // Setup two strategies
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200); // 2%
+
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
+
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        // Set yields: 60e18 from strategy1, 40e18 from strategy2
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
+        mockStrategy2.setBalances(address(strategyToken2), minterAddr, 500e18, 40e18);
+
+        // Fund strategies with yield tokens
+        strategyToken1.mint(address(mockStrategy1), 60e18);
+        strategyToken2.mint(address(mockStrategy2), 40e18);
+
+        // Pause strategy1's token — only strategy2 yield should be claimable
+        accumulator.pauseToken(address(strategyToken1));
+
+        // Fund claimer: only strategy2's yield matters (40e18 * 0.98 = 39.2e18)
+        rewardToken.mint(claimer, 50e18);
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        accumulator.approvePhlimbo(type(uint256).max);
+
+        // Claim should succeed, collecting only from unpaused strategy2
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Claimer should NOT receive strategyToken1 (paused)
+        assertEq(strategyToken1.balanceOf(claimer), 0, "Should not receive yield from paused token");
+        // Claimer SHOULD receive strategyToken2 yield
+        assertEq(strategyToken2.balanceOf(claimer), 40e18, "Should receive yield from unpaused token");
+
+        // Only strategy2 should have had withdrawFrom called
+        assertEq(mockStrategy1.withdrawFromCallCount(), 0, "Paused strategy should not be called");
+        assertEq(mockStrategy2.withdrawFromCallCount(), 1, "Unpaused strategy should be called");
+
+        // Verify payment: 40e18 * 0.98 = 39.2e18
+        uint256 expectedPayment = 40e18 * 98 / 100;
+        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive discounted payment for unpaused yield only");
+    }
+
+    /// @notice claim() returns the same total as calculateClaimAmount() when a token is paused.
+    function test_claim_ConsistentWithCalculateClaimAmount_WhenTokenPaused() public {
+        address claimer = makeAddr("claimer");
+
+        // Setup two strategies
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200); // 2%
+
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
+
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        // Set yields: 60e18 from strategy1, 40e18 from strategy2
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
+        mockStrategy2.setBalances(address(strategyToken2), minterAddr, 500e18, 40e18);
+
+        // Fund strategies with yield tokens
+        strategyToken1.mint(address(mockStrategy1), 60e18);
+        strategyToken2.mint(address(mockStrategy2), 40e18);
+
+        // Pause strategy1's token
+        accumulator.pauseToken(address(strategyToken1));
+
+        // Query calculateClaimAmount BEFORE claim — should reflect only unpaused yield
+        uint256 calculatedAmount = accumulator.calculateClaimAmount();
+
+        // Fund claimer with enough to cover the payment
+        rewardToken.mint(claimer, calculatedAmount + 1e18);
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        accumulator.approvePhlimbo(type(uint256).max);
+
+        // Record claimer's reward token balance before claim
+        uint256 claimerBalanceBefore = rewardToken.balanceOf(claimer);
+
+        // Execute claim
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // The actual payment deducted from claimer should match calculateClaimAmount
+        uint256 actualPayment = claimerBalanceBefore - rewardToken.balanceOf(claimer);
+        assertEq(actualPayment, calculatedAmount, "claim() payment should match calculateClaimAmount() when token is paused");
+    }
+
+    /// @notice Regression: claim() works normally when no tokens are paused.
+    function test_claim_WorksNormally_NoTokensPaused() public {
+        address claimer = makeAddr("claimer");
+
+        // Setup two strategies — no tokens paused
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200); // 2%
+
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
+
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        // Set yields: 60e18 from strategy1, 40e18 from strategy2 = 100e18 total
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
+        mockStrategy2.setBalances(address(strategyToken2), minterAddr, 500e18, 40e18);
+
+        // Fund strategies with yield tokens
+        strategyToken1.mint(address(mockStrategy1), 60e18);
+        strategyToken2.mint(address(mockStrategy2), 40e18);
+
+        // Fund claimer: 100e18 total * 0.98 = 98e18 payment
+        rewardToken.mint(claimer, 100e18);
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        accumulator.approvePhlimbo(type(uint256).max);
+
+        // Claim — no tokens paused, should collect from both strategies
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Claimer should receive yield from both strategies
+        assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
+        assertEq(strategyToken2.balanceOf(claimer), 40e18, "Should receive yield from strategy2");
+
+        // Both strategies should have had withdrawFrom called
+        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "Strategy1 withdrawFrom called");
+        assertEq(mockStrategy2.withdrawFromCallCount(), 1, "Strategy2 withdrawFrom called");
+
+        // Verify payment: 100e18 * 0.98 = 98e18
+        uint256 expectedPayment = 100e18 * 98 / 100;
+        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive full discounted payment");
     }
 }
 
