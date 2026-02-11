@@ -102,6 +102,13 @@ interface IClaimArbitrage {
      */
     error InvalidRecipient();
 
+    /**
+     * @notice Thrown when _settleResidualDelta encounters a token with no configured pool
+     *         and no hardcoded fallback (not sUSDS or phUSD)
+     * @param token The token address that has no settlement path
+     */
+    error UnsettledResidualForUnconfiguredToken(address token);
+
     /*//////////////////////////////////////////////////////////////
                             FUNCTIONS
     //////////////////////////////////////////////////////////////*/
