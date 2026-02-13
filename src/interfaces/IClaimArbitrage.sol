@@ -14,13 +14,13 @@ interface IClaimArbitrage {
     /**
      * @notice Parameters for executing the atomic arbitrage
      * @param pumpAmount sUSDS to sell for phUSD (calibrated off-chain to just cross targetPrice)
-     * @param usdcNeeded USDC to borrow for claim payment (= calculateClaimAmount())
+     * @param rewardTokenNeeded Reward token to borrow for claim payment (= calculateClaimAmount())
      * @param pumpPriceLimit max sqrtPriceX96 willing to pay when buying phUSD
      * @param unwindPriceLimit min sqrtPriceX96 willing to accept when selling phUSD back
      */
     struct ExecuteParams {
         uint256 pumpAmount;
-        uint256 usdcNeeded;
+        uint256 rewardTokenNeeded;
         uint160 pumpPriceLimit;
         uint160 unwindPriceLimit;
     }
@@ -37,10 +37,10 @@ interface IClaimArbitrage {
     event ArbitrageExecuted(address indexed caller, uint256 ethProfit);
 
     /**
-     * @notice Emitted when a stable-to-USDC pool mapping is updated
+     * @notice Emitted when a stable-to-reward-token pool mapping is updated
      * @param stable The stablecoin address
      */
-    event StableToUSDCPoolSet(address indexed stable);
+    event StableToRewardTokenPoolSet(address indexed stable);
 
     /**
      * @notice Emitted when a known stablecoin is added
@@ -77,12 +77,12 @@ interface IClaimArbitrage {
     error OnlyPoolManager();
 
     /**
-     * @notice Thrown when the arbitrage produces no USDC profit
+     * @notice Thrown when the arbitrage produces no reward-token profit
      */
     error NoProfit();
 
     /**
-     * @notice Thrown when the USDC-to-WETH conversion produces no WETH
+     * @notice Thrown when the reward-token-to-WETH conversion produces no WETH
      */
     error NoWETHProfit();
 
