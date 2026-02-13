@@ -41,9 +41,6 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
     /// @notice The StableYieldAccumulator to claim from
     IStableYieldAccumulator public immutable sya;
 
-    /// @notice USDC token address
-    address public immutable USDC;
-
     /// @notice WETH token address
     address public immutable WETH;
 
@@ -60,14 +57,14 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
     /// @notice Pool key for the phUSD/sUSDS pool (price manipulation + unwind)
     PoolKey public phUSD_sUSDS_pool;
 
-    /// @notice Pool key for the USDC/WETH pool (profit conversion)
-    PoolKey public USDC_WETH_pool;
+    /// @notice Pool key for the reward-token/WETH pool (profit conversion)
+    PoolKey public rewardTokenWethPool;
 
     /// @notice Pool key for the sUSDS/USDC pool (slippage coverage)
     PoolKey public sUSDS_USDC_pool;
 
-    /// @notice Mapping from stablecoin address to its USDC conversion pool
-    mapping(address => PoolKey) public stableToUSDCPool;
+    /// @notice Mapping from stablecoin address to its reward-token conversion pool
+    mapping(address => PoolKey) public stableToRewardTokenPool;
 
     /// @notice Iterable list of stablecoins that claim() might yield
     address[] public knownStables;
@@ -83,7 +80,6 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
      * @notice Initialize the ClaimArbitrage contract
      * @param _poolManager Uniswap V4 PoolManager address
      * @param _sya StableYieldAccumulator address
-     * @param _usdc USDC token address
      * @param _weth WETH token address
      * @param _sUSDS sUSDS token address
      * @param _phUSD phUSD token address
@@ -91,14 +87,12 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
     constructor(
         address _poolManager,
         address _sya,
-        address _usdc,
         address _weth,
         address _sUSDS,
         address _phUSD
     ) Ownable(msg.sender) {
         poolManager = IPoolManager(_poolManager);
         sya = IStableYieldAccumulator(_sya);
-        USDC = _usdc;
         WETH = _weth;
         sUSDS = _sUSDS;
         phUSD = _phUSD;
@@ -138,6 +132,15 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         (ExecuteParams memory p, address caller) = abi.decode(data, (ExecuteParams, address));
 
         // ──────────────────────────────────────────────────────────
+        // PRE-FLIGHT: CACHE REWARD TOKEN
+        // Query sya.rewardToken() once and cache it for the entire callback.
+        // Steps 2, 3, 5, and 7 all depend on the current reward token denomination.
+        // Using the cached value avoids repeated STATICCALL overhead and ensures
+        // consistency within a single transaction. (audit-5 M-01 fix)
+        // ──────────────────────────────────────────────────────────
+        address rewardToken_ = sya.rewardToken();
+
+        // ──────────────────────────────────────────────────────────
         // PRE-FLIGHT: VALIDATE KNOWN STABLES COVERAGE
         // Ensure every SYA strategy token is in knownStables[] so Step 5 won't
         // silently skip any distributed tokens. Reverting here inside the PM callback
@@ -162,19 +165,23 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         );
 
         // ──────────────────────────────────────────────────────────
-        // STEP 2: BORROW USDC (flash)
-        // take() sends actual USDC tokens to this contract
-        // and records a negative USDC delta (debt).
+        // STEP 2: BORROW REWARD TOKEN (flash)
+        // take() sends actual reward tokens to this contract
+        // and records a negative reward-token delta (debt).
+        // Note: If the reward token changes to a token with insufficient
+        // PoolManager liquidity, the borrow will fail. The owner must
+        // ensure adequate pool liquidity for the current reward token.
         // ──────────────────────────────────────────────────────────
-        poolManager.take(Currency.wrap(USDC), address(this), p.usdcNeeded);
+        poolManager.take(Currency.wrap(rewardToken_), address(this), p.rewardTokenNeeded);
 
         // ──────────────────────────────────────────────────────────
         // STEP 3: CALL CLAIM
         // phUSD price is now above the floor -> claim() succeeds.
-        // We pay usdcNeeded USDC (discounted), receive full-value
-        // mixed stablecoins as real ERC20 tokens.
+        // We pay rewardTokenNeeded in the current reward token (discounted),
+        // receive full-value mixed stablecoins as real ERC20 tokens.
+        // (audit-5 M-01 fix: approve the current reward token, not hardcoded USDC)
         // ──────────────────────────────────────────────────────────
-        IERC20(USDC).approve(address(sya), p.usdcNeeded);
+        IERC20(rewardToken_).approve(address(sya), p.rewardTokenNeeded);
         sya.claim();
 
         // ──────────────────────────────────────────────────────────
@@ -195,17 +202,15 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         );
 
         // ──────────────────────────────────────────────────────────
-        // STEP 5: CONVERT RECEIVED STABLECOINS -> USDC
+        // STEP 5: CONVERT RECEIVED STABLECOINS -> REWARD TOKEN
         // For each stablecoin received from claim():
         //   1. Deposit tokens into PM (positive delta / credit)
-        //   2. Swap stablecoin -> USDC within PM (adjusts deltas)
+        //   2. Swap stablecoin -> reward token within PM (adjusts deltas)
         //
-        // Cache reward token to avoid repeated external calls in the loop.
-        // We query sya.rewardToken() rather than using the immutable USDC address because
-        // the reward token is a property of SYA, not of this contract. If SYA's reward token
-        // ever changes, this logic adapts automatically.
+        // Uses rewardToken_ cached in PRE-FLIGHT above. The reward token is a
+        // property of SYA, not of this contract. If SYA's reward token ever
+        // changes, this logic adapts automatically.
         // ──────────────────────────────────────────────────────────
-        address _rewardToken = sya.rewardToken();
 
         for (uint256 i = 0; i < knownStables.length; i++) {
             address stable = knownStables[i];
@@ -217,20 +222,20 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
 
             // If this stable IS the reward token (e.g., USDC from a USDC-yielding strategy),
             // skip the swap — it's already the target denomination. The deposit above already
-            // created the positive USDC delta we need. Attempting to swap reward->reward would
-            // require a non-existent self-referential pool and is nonsensical.
+            // created the positive reward-token delta we need. Attempting to swap reward->reward
+            // would require a non-existent self-referential pool and is nonsensical.
             //
-            // Delta accounting recap for the reward token (USDC):
-            //   Step 2:  take(USDC, usdcNeeded)          -> negative USDC delta
-            //   Step 3:  claim() pays Phlimbo in USDC     -> real USDC leaves contract
-            //   Step 3:  claim() receives USDC from strategies -> real USDC enters contract
-            //   Step 5:  _depositIntoPM(USDC, balance)    -> positive USDC delta
+            // Delta accounting recap for the reward token:
+            //   Step 2:  take(rewardToken, rewardTokenNeeded) -> negative reward-token delta
+            //   Step 3:  claim() pays Phlimbo in reward token  -> real tokens leave contract
+            //   Step 3:  claim() receives reward token from strategies -> real tokens enter contract
+            //   Step 5:  _depositIntoPM(rewardToken, balance)  -> positive reward-token delta
             //   Net:     positive delta = profit from strategies minus Phlimbo payment
-            //   Step 7:  swap net USDC delta -> WETH       -> profit extraction
-            if (stable == _rewardToken) continue;
+            //   Step 7:  swap net reward-token delta -> WETH    -> profit extraction
+            if (stable == rewardToken_) continue;
 
-            // Swap stable -> USDC (exact input)
-            PoolKey memory pool = stableToUSDCPool[stable];
+            // Swap stable -> reward token (exact input)
+            PoolKey memory pool = stableToRewardTokenPool[stable];
             bool stableIsToken0 = (Currency.unwrap(pool.currency0) == stable);
             poolManager.swap(
                 pool,
@@ -277,20 +282,20 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         _settleResidualDelta(sUSDS);
 
         // ──────────────────────────────────────────────────────────
-        // STEP 7: CONVERT USDC PROFIT TO WETH
-        // Remaining positive USDC delta = profit minus costs.
-        // Swap all of it to WETH.
+        // STEP 7: CONVERT REWARD TOKEN PROFIT TO WETH
+        // Remaining positive reward-token delta = profit minus costs.
+        // Swap all of it to WETH. (audit-5 M-01 fix: use rewardToken_, not hardcoded USDC)
         // ──────────────────────────────────────────────────────────
-        int256 usdcProfit = poolManager.currencyDelta(address(this), Currency.wrap(USDC));
-        if (usdcProfit <= 0) revert NoProfit();
+        int256 rewardTokenProfit = poolManager.currencyDelta(address(this), Currency.wrap(rewardToken_));
+        if (rewardTokenProfit <= 0) revert NoProfit();
 
-        bool usdcIsToken0 = (Currency.unwrap(USDC_WETH_pool.currency0) == USDC);
+        bool rewardTokenIsToken0 = (Currency.unwrap(rewardTokenWethPool.currency0) == rewardToken_);
         poolManager.swap(
-            USDC_WETH_pool,
+            rewardTokenWethPool,
             SwapParams({
-                zeroForOne: usdcIsToken0,
-                amountSpecified: -int256(uint256(usdcProfit)), // exact input: sell all USDC
-                sqrtPriceLimitX96: usdcIsToken0
+                zeroForOne: rewardTokenIsToken0,
+                amountSpecified: -int256(uint256(rewardTokenProfit)), // exact input: sell all reward token
+                sqrtPriceLimitX96: rewardTokenIsToken0
                     ? type(uint160).min + 1
                     : type(uint160).max - 1
             }),
@@ -350,8 +355,14 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
      * @dev If a currency has residual delta (positive or negative), settle it to zero.
      *      - Zero delta: no-op.
      *      - Positive delta: take excess tokens from PM, then re-deposit them to zero the delta.
-     *      - Negative delta: buy the owed amount via the configured pool (stableToUSDCPool,
+     *      - Negative delta: buy the owed amount via the configured pool (stableToRewardTokenPool,
      *        sUSDS_USDC_pool, or phUSD_sUSDS_pool fallback).
+     *
+     *      Note on sUSDS_USDC_pool: This pool is genuinely an sUSDS/USDC pool used for slippage
+     *      coverage from the pump/unwind cycle. It is not renamed to reference the dynamic reward
+     *      token because it handles a specific known pair (sUSDS<->USDC). If the reward token
+     *      changes from USDC, the owner must update this pool accordingly. The settlement cost
+     *      feeds into the reward-token delta via Step 7's profit conversion.
      * @param token The token to check and settle
      */
     function _settleResidualDelta(address token) internal {
@@ -368,8 +379,8 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         }
 
         // Negative delta: need to buy `token` to zero the debt.
-        // Use the stableToUSDCPool mapping if available, otherwise use hardcoded fallbacks.
-        PoolKey memory pool = stableToUSDCPool[token];
+        // Use the stableToRewardTokenPool mapping if available, otherwise use hardcoded fallbacks.
+        PoolKey memory pool = stableToRewardTokenPool[token];
         if (Currency.unwrap(pool.currency0) == address(0) && Currency.unwrap(pool.currency1) == address(0)) {
             if (token == sUSDS) {
                 pool = sUSDS_USDC_pool;
@@ -452,13 +463,13 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Set the pool key mapping for a stablecoin to USDC conversion
+     * @notice Set the pool key mapping for a stablecoin to reward-token conversion
      * @param stable The stablecoin address
-     * @param pool The PoolKey for the stable/USDC pool
+     * @param pool The PoolKey for the stable/reward-token pool
      */
-    function setStableToUSDCPool(address stable, PoolKey calldata pool) external onlyOwner {
-        stableToUSDCPool[stable] = pool;
-        emit StableToUSDCPoolSet(stable);
+    function setStableToRewardTokenPool(address stable, PoolKey calldata pool) external onlyOwner {
+        stableToRewardTokenPool[stable] = pool;
+        emit StableToRewardTokenPoolSet(stable);
     }
 
     /**
@@ -488,18 +499,18 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
     /**
      * @notice Set the pool keys for the three main pools and the token ordering flag
      * @param _phUSD_sUSDS_pool Pool key for phUSD/sUSDS
-     * @param _USDC_WETH_pool Pool key for USDC/WETH
+     * @param _rewardTokenWethPool Pool key for reward-token/WETH
      * @param _sUSDS_USDC_pool Pool key for sUSDS/USDC
      * @param _token0IsPhUSD Whether phUSD is token0 in the phUSD/sUSDS pool
      */
     function setPoolKeys(
         PoolKey calldata _phUSD_sUSDS_pool,
-        PoolKey calldata _USDC_WETH_pool,
+        PoolKey calldata _rewardTokenWethPool,
         PoolKey calldata _sUSDS_USDC_pool,
         bool _token0IsPhUSD
     ) external onlyOwner {
         phUSD_sUSDS_pool = _phUSD_sUSDS_pool;
-        USDC_WETH_pool = _USDC_WETH_pool;
+        rewardTokenWethPool = _rewardTokenWethPool;
         sUSDS_USDC_pool = _sUSDS_USDC_pool;
         token0IsPhUSD = _token0IsPhUSD;
         emit PoolKeysUpdated();

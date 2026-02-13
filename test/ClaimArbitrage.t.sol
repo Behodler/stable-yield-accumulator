@@ -81,6 +81,11 @@ contract MockSYA {
         rewardToken = _rewardToken;
     }
 
+    /// @notice Change the reward token (for testing reward-token-change scenarios)
+    function setRewardToken(address _rewardToken) external {
+        rewardToken = _rewardToken;
+    }
+
     function setupClaim(
         uint256 _claimPayment,
         address[] memory _yieldTokens,
@@ -503,7 +508,7 @@ contract SettleResidualDeltaTester is IUnlockCallback {
     address public immutable phUSD;
     PoolKey public sUSDS_USDC_pool;
     PoolKey public phUSD_sUSDS_pool;
-    mapping(address => PoolKey) public stableToUSDCPool;
+    mapping(address => PoolKey) public stableToRewardTokenPool;
 
     address public settleToken;
     address public settleToken2;
@@ -525,8 +530,8 @@ contract SettleResidualDeltaTester is IUnlockCallback {
         phUSD_sUSDS_pool = _phUSD_sUSDS_pool;
     }
 
-    function setStableToUSDCPool(address stable, PoolKey memory pool) external {
-        stableToUSDCPool[stable] = pool;
+    function setStableToRewardTokenPool(address stable, PoolKey memory pool) external {
+        stableToRewardTokenPool[stable] = pool;
     }
 
     function settleResidualDelta(address token) external {
@@ -560,7 +565,7 @@ contract SettleResidualDeltaTester is IUnlockCallback {
             return;
         }
 
-        PoolKey memory pool = stableToUSDCPool[token];
+        PoolKey memory pool = stableToRewardTokenPool[token];
         if (Currency.unwrap(pool.currency0) == address(0) && Currency.unwrap(pool.currency1) == address(0)) {
             if (token == sUSDS) {
                 pool = sUSDS_USDC_pool;
@@ -627,7 +632,7 @@ contract ClaimArbitrageTest is Test {
 
     // Events
     event ArbitrageExecuted(address indexed caller, uint256 ethProfit);
-    event StableToUSDCPoolSet(address indexed stable);
+    event StableToRewardTokenPoolSet(address indexed stable);
     event KnownStableAdded(address indexed stable);
     event KnownStableRemoved(address indexed stable);
     event PoolKeysUpdated();
@@ -656,7 +661,6 @@ contract ClaimArbitrageTest is Test {
         arb = new ClaimArbitrage(
             address(pm),
             address(sya),
-            address(usdc),
             address(weth),
             address(susds),
             address(phusd)
@@ -720,8 +724,8 @@ contract ClaimArbitrageTest is Test {
         // Configure known stables
         arb.addKnownStable(address(usdt));
         arb.addKnownStable(address(dai));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
-        arb.setStableToUSDCPool(address(dai), DAI_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(dai), DAI_USDC_key);
 
         // Register strategies in MockSYA so _validateKnownStablesCoverage() passes.
         // Each strategy maps to a token that must be in knownStables[].
@@ -747,7 +751,7 @@ contract ClaimArbitrageTest is Test {
 
         params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 90e18,
+            rewardTokenNeeded: 90e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -760,7 +764,6 @@ contract ClaimArbitrageTest is Test {
     function test_constructor_SetsImmutables() public view {
         assertEq(address(arb.poolManager()), address(pm), "poolManager should be set");
         assertEq(address(arb.sya()), address(sya), "sya should be set");
-        assertEq(arb.USDC(), address(usdc), "USDC should be set");
         assertEq(arb.WETH(), address(weth), "WETH should be set");
         assertEq(arb.sUSDS(), address(susds), "sUSDS should be set");
         assertEq(arb.phUSD(), address(phusd), "phUSD should be set");
@@ -803,7 +806,7 @@ contract ClaimArbitrageTest is Test {
         bytes memory data = abi.encode(
             IClaimArbitrage.ExecuteParams({
                 pumpAmount: 10e18,
-                usdcNeeded: 90e18,
+                rewardTokenNeeded: 90e18,
                 pumpPriceLimit: type(uint160).max - 1,
                 unwindPriceLimit: type(uint160).min + 1
             }),
@@ -896,7 +899,7 @@ contract ClaimArbitrageTest is Test {
         // With default 1:1 swaps and no configured swap results, pump/unwind deltas
         // cancel perfectly, and the claim produces 0 net USDC profit.
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         address[] memory yieldTokens = new address[](1);
@@ -910,7 +913,7 @@ contract ClaimArbitrageTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 100e18,
+            rewardTokenNeeded: 100e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -934,7 +937,7 @@ contract ClaimArbitrageTest is Test {
         // We'd need to configure USDC_WETH to return 0.
 
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         address[] memory yieldTokens = new address[](1);
@@ -949,7 +952,7 @@ contract ClaimArbitrageTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 90e18,
+            rewardTokenNeeded: 90e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -972,7 +975,7 @@ contract ClaimArbitrageTest is Test {
     function test_residualSUSDSDelta_CoveredViaSwap() public {
         // Setup scenario where pump/unwind creates sUSDS shortfall
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         address[] memory yieldTokens = new address[](1);
@@ -988,7 +991,7 @@ contract ClaimArbitrageTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 80e18,
+            rewardTokenNeeded: 80e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -1020,24 +1023,24 @@ contract ClaimArbitrageTest is Test {
                     OWNER FUNCTION TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_setStableToUSDCPool_SetsMapping() public {
+    function test_setStableToRewardTokenPool_SetsMapping() public {
         PoolKey memory pool = _makePoolKey(address(usdt), address(usdc));
 
         vm.expectEmit(true, false, false, true);
-        emit StableToUSDCPoolSet(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), pool);
+        emit StableToRewardTokenPoolSet(address(usdt));
+        arb.setStableToRewardTokenPool(address(usdt), pool);
 
         // Verify by reading the stored pool key fields
-        (Currency c0, Currency c1,,,) = arb.stableToUSDCPool(address(usdt));
+        (Currency c0, Currency c1,,,) = arb.stableToRewardTokenPool(address(usdt));
         assertEq(Currency.unwrap(c0), Currency.unwrap(pool.currency0), "currency0 should match");
         assertEq(Currency.unwrap(c1), Currency.unwrap(pool.currency1), "currency1 should match");
     }
 
-    function test_setStableToUSDCPool_RevertIf_NotOwner() public {
+    function test_setStableToRewardTokenPool_RevertIf_NotOwner() public {
         PoolKey memory pool = _makePoolKey(address(usdt), address(usdc));
         vm.prank(caller);
         vm.expectRevert();
-        arb.setStableToUSDCPool(address(usdt), pool);
+        arb.setStableToRewardTokenPool(address(usdt), pool);
     }
 
     function test_addKnownStable_AddsToList() public {
@@ -1224,7 +1227,7 @@ contract ClaimArbitrageTest is Test {
         // Full M-01 scenario: SYA has a strategy token (DAI) that is NOT in knownStables[].
         // execute() should revert instead of silently locking the DAI tokens.
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
 
         // Register strategies: USDT (covered) + DAI (NOT covered)
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
@@ -1243,7 +1246,7 @@ contract ClaimArbitrageTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 90e18,
+            rewardTokenNeeded: 90e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -1257,7 +1260,7 @@ contract ClaimArbitrageTest is Test {
     function test_validation_M01Scenario_ExecuteSucceedsAfterAddingMissingStable() public {
         // Same as above, but after adding DAI to knownStables[], execute() succeeds.
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
 
         // Register strategies: USDT + DAI
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
@@ -1276,11 +1279,11 @@ contract ClaimArbitrageTest is Test {
 
         // Now add the missing DAI stable and its pool mapping
         arb.addKnownStable(address(dai));
-        arb.setStableToUSDCPool(address(dai), DAI_USDC_key);
+        arb.setStableToRewardTokenPool(address(dai), DAI_USDC_key);
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 90e18,
+            rewardTokenNeeded: 90e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -1304,7 +1307,7 @@ contract ClaimArbitrageTest is Test {
         // Register USDC as a known stable (it's the reward token)
         arb.addKnownStable(address(usdc));
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
 
         // Register strategies: one produces USDT, one produces USDC (the reward token)
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
@@ -1323,7 +1326,7 @@ contract ClaimArbitrageTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 80e18,
+            rewardTokenNeeded: 80e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -1362,7 +1365,7 @@ contract ClaimArbitrageTest is Test {
         // knownStables = {USDT, USDC}, but SYA only distributes USDT
         arb.addKnownStable(address(usdt));
         arb.addKnownStable(address(usdc));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
 
         // Only USDT strategy registered (validation only cares about SYA→knownStables direction)
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
@@ -1377,7 +1380,7 @@ contract ClaimArbitrageTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 90e18,
+            rewardTokenNeeded: 90e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -1389,6 +1392,174 @@ contract ClaimArbitrageTest is Test {
         // USDT was swapped normally. Caller received ETH profit.
         assertTrue(caller.balance > 0, "Caller should receive ETH profit");
         assertEq(usdt.balanceOf(address(arb)), 0, "No residual USDT");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+            REWARD TOKEN FLEXIBILITY TESTS (Story 016 / audit-5 M-01)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Baseline test: execute() succeeds when rewardToken == USDC (default setup)
+     */
+    function test_rewardToken_ExecuteSucceedsWhenRewardTokenIsUSDC() public {
+        // Default setup: SYA.rewardToken() == USDC
+        assertEq(sya.rewardToken(), address(usdc), "Precondition: rewardToken should be USDC");
+
+        IClaimArbitrage.ExecuteParams memory params = _setupProfitableScenario();
+
+        vm.prank(caller);
+        arb.execute(params);
+
+        assertTrue(caller.balance > 0, "Caller should receive ETH profit with USDC as reward token");
+        assertEq(sya.claimCallCount(), 1, "claim() should be called");
+    }
+
+    /**
+     * @notice Test: SYA owner changes rewardToken to a non-USDC stablecoin (USDT),
+     *         then execute() succeeds end-to-end. This validates the audit-5 M-01 fix.
+     * @dev Steps:
+     *   1. Change SYA rewardToken from USDC to USDT
+     *   2. Reconfigure pools: rewardTokenWethPool now points to USDT/WETH
+     *   3. Fund PM with USDT for the flash borrow
+     *   4. SYA claim expects USDT payment, distributes DAI
+     *   5. execute() should succeed using USDT as reward token throughout
+     */
+    function test_rewardToken_ExecuteSucceedsAfterRewardTokenChange() public {
+        // Step 1: Change SYA's reward token from USDC to USDT
+        sya.setRewardToken(address(usdt));
+        assertEq(sya.rewardToken(), address(usdt), "SYA reward token should now be USDT");
+
+        // Step 2: Create USDT/WETH pool key and reconfigure arb
+        PoolKey memory USDT_WETH_key = _makePoolKey(address(usdt), address(weth));
+        bool _token0IsPhUSD = address(phusd) < address(susds);
+        arb.setPoolKeys(phUSD_sUSDS_key, USDT_WETH_key, sUSDS_USDC_key, _token0IsPhUSD);
+
+        // Step 3: Register known stables and their pool mappings.
+        // DAI is the yield token; it needs a pool to convert DAI -> USDT (the new reward token)
+        PoolKey memory DAI_USDT_key = _makePoolKey(address(dai), address(usdt));
+        arb.addKnownStable(address(dai));
+        arb.setStableToRewardTokenPool(address(dai), DAI_USDT_key);
+
+        // Register strategies in MockSYA
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        // Step 4: Configure SYA claim: pays 80 USDT (new reward token), gets 100 DAI
+        address[] memory yieldTokens = new address[](1);
+        yieldTokens[0] = address(dai);
+        uint256[] memory yieldAmounts = new uint256[](1);
+        yieldAmounts[0] = 100e18;
+        sya.setupClaim(80e18, yieldTokens, yieldAmounts);
+        dai.mint(address(sya), 100e18);
+
+        // Fund PM with USDT for take() operation (flash borrow)
+        usdt.mint(address(pm), 1000e18);
+
+        // Step 5: Execute with USDT as reward token
+        IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            rewardTokenNeeded: 80e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+
+        vm.prank(caller);
+        arb.execute(params);
+
+        // Verify success
+        assertTrue(caller.balance > 0, "Caller should receive ETH profit with USDT as reward token");
+        assertEq(sya.claimCallCount(), 1, "claim() should be called");
+        assertEq(dai.balanceOf(address(arb)), 0, "No residual DAI in arb");
+    }
+
+    /**
+     * @notice Test: Step 3 approves the current rewardToken (not USDC).
+     *         After changing reward token to USDT, the approve() call in Step 3
+     *         must target USDT. The MockSYA.claim() calls transferFrom on the
+     *         reward token, which would revert if the wrong token was approved.
+     */
+    function test_rewardToken_Step3ApprovesCorrectToken() public {
+        // Change reward token to USDT
+        sya.setRewardToken(address(usdt));
+
+        // Setup pools with USDT as reward token
+        PoolKey memory USDT_WETH_key = _makePoolKey(address(usdt), address(weth));
+        bool _token0IsPhUSD = address(phusd) < address(susds);
+        arb.setPoolKeys(phUSD_sUSDS_key, USDT_WETH_key, sUSDS_USDC_key, _token0IsPhUSD);
+
+        // DAI is the yield token, routed through DAI/USDT pool
+        PoolKey memory DAI_USDT_key = _makePoolKey(address(dai), address(usdt));
+        arb.addKnownStable(address(dai));
+        arb.setStableToRewardTokenPool(address(dai), DAI_USDT_key);
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        // claim: pays 80 USDT, gets 100 DAI
+        address[] memory yieldTokens = new address[](1);
+        yieldTokens[0] = address(dai);
+        uint256[] memory yieldAmounts = new uint256[](1);
+        yieldAmounts[0] = 100e18;
+        sya.setupClaim(80e18, yieldTokens, yieldAmounts);
+        dai.mint(address(sya), 100e18);
+        usdt.mint(address(pm), 1000e18);
+
+        IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            rewardTokenNeeded: 80e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+
+        // If Step 3 still approved USDC instead of USDT, the claim() call would
+        // revert because MockSYA.claim() calls transferFrom on rewardToken (USDT).
+        // Success proves the correct token was approved.
+        vm.prank(caller);
+        arb.execute(params);
+
+        assertEq(sya.claimCallCount(), 1, "claim() succeeded: Step 3 approved the correct reward token (USDT)");
+    }
+
+    /**
+     * @notice Test: Step 7 queries the correct reward-token delta.
+     *         After changing reward token to USDT, Step 7 must query the USDT delta
+     *         (not USDC) for profit calculation and swap via the USDT/WETH pool.
+     */
+    function test_rewardToken_Step7QueriesCorrectDelta() public {
+        // Change reward token to USDT
+        sya.setRewardToken(address(usdt));
+
+        // Setup pools with USDT as reward token
+        PoolKey memory USDT_WETH_key = _makePoolKey(address(usdt), address(weth));
+        bool _token0IsPhUSD = address(phusd) < address(susds);
+        arb.setPoolKeys(phUSD_sUSDS_key, USDT_WETH_key, sUSDS_USDC_key, _token0IsPhUSD);
+
+        // DAI is the yield token, routed through DAI/USDT pool
+        PoolKey memory DAI_USDT_key = _makePoolKey(address(dai), address(usdt));
+        arb.addKnownStable(address(dai));
+        arb.setStableToRewardTokenPool(address(dai), DAI_USDT_key);
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+
+        // claim: pays 80 USDT, gets 100 DAI (20% discount = guaranteed profit)
+        address[] memory yieldTokens = new address[](1);
+        yieldTokens[0] = address(dai);
+        uint256[] memory yieldAmounts = new uint256[](1);
+        yieldAmounts[0] = 100e18;
+        sya.setupClaim(80e18, yieldTokens, yieldAmounts);
+        dai.mint(address(sya), 100e18);
+        usdt.mint(address(pm), 1000e18);
+
+        IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            rewardTokenNeeded: 80e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+
+        vm.prank(caller);
+        arb.execute(params);
+
+        // If Step 7 queried the USDC delta instead of USDT, it would see 0 USDC
+        // and revert with NoProfit(). Success proves Step 7 correctly queries
+        // the USDT delta and swaps via the USDT/WETH pool.
+        assertTrue(caller.balance > 0, "Caller received ETH: Step 7 used correct reward token delta");
     }
 }
 
@@ -1452,7 +1623,6 @@ contract SettleResidualDeltaTest is Test {
         arb = new ClaimArbitrage(
             address(pm),
             address(sya),
-            address(usdc),
             address(weth),
             address(susds),
             address(phusd)
@@ -1605,7 +1775,7 @@ contract SettleResidualDeltaTest is Test {
         // logic for non-zero residuals.
 
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         // claim: pays 80 USDC, gets 100 USDT (20% discount for healthy profit margin)
@@ -1618,7 +1788,7 @@ contract SettleResidualDeltaTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 80e18,
+            rewardTokenNeeded: 80e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
@@ -1642,7 +1812,7 @@ contract SettleResidualDeltaTest is Test {
      */
     function test_fullFlow_SecondarySettlementPresent_ExecuteSucceeds() public {
         arb.addKnownStable(address(usdt));
-        arb.setStableToUSDCPool(address(usdt), USDT_USDC_key);
+        arb.setStableToRewardTokenPool(address(usdt), USDT_USDC_key);
         sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdt));
 
         // Large discount to absorb any settlement costs
@@ -1655,7 +1825,7 @@ contract SettleResidualDeltaTest is Test {
 
         IClaimArbitrage.ExecuteParams memory params = IClaimArbitrage.ExecuteParams({
             pumpAmount: 10e18,
-            usdcNeeded: 70e18,
+            rewardTokenNeeded: 70e18,
             pumpPriceLimit: type(uint160).max - 1,
             unwindPriceLimit: type(uint160).min + 1
         });
