@@ -22,6 +22,28 @@ contract MockERC20 is ERC20 {
 }
 
 /**
+ * @title MockUSDT
+ * @notice ERC20 mock that reverts on non-zero-to-non-zero approve, matching real USDT behavior.
+ * @dev Real USDT requires allowance to be zero before setting a new non-zero value.
+ *      This enforces: approve(spender, newAmount) reverts if allowance(owner, spender) != 0 && newAmount != 0.
+ */
+contract MockUSDT is ERC20 {
+    constructor(string memory name, string memory symbol) ERC20(name, symbol) {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function approve(address spender, uint256 value) public override returns (bool) {
+        // USDT behavior: revert if current allowance is non-zero and new value is non-zero
+        if (allowance(msg.sender, spender) != 0 && value != 0) {
+            revert("USDT: approve from non-zero to non-zero");
+        }
+        return super.approve(spender, value);
+    }
+}
+
+/**
  * @title MockERC20WithDecimals
  * @notice ERC20 mock with configurable decimals for testing multi-decimal scenarios
  */
@@ -1910,6 +1932,82 @@ contract ConditionalClaimTest is Test {
         accumulator.claim();
 
         assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed after price increase");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                USDT-LIKE TOKEN COMPATIBILITY TESTS (M-03)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Test that second approvePhlimbo() succeeds after partial consumption by Phlimbo.
+     * @dev With a USDT-like reward token, the first approvePhlimbo() sets a non-zero allowance.
+     *      After Phlimbo partially consumes it via collectReward(), a residual allowance remains.
+     *      A raw approve() would revert (non-zero -> non-zero). forceApprove() must handle this.
+     */
+    function test_approvePhlimbo_SecondCallSucceeds_AfterPartialConsumption_WithUSDTLikeToken() public {
+        // Deploy a USDT-like reward token
+        MockUSDT usdtToken = new MockUSDT("USDT", "USDT");
+
+        // Deploy fresh accumulator and phlimbo for this test
+        StableYieldAccumulator acc = new StableYieldAccumulator();
+        MockPhlimbo phlimboMock = new MockPhlimbo(address(usdtToken));
+        phlimboMock.setYieldAccumulator(address(acc));
+
+        // Configure accumulator
+        acc.setPhlimbo(address(phlimboMock));
+        acc.setRewardToken(address(usdtToken));
+
+        // First approvePhlimbo (0 -> 100e18): should succeed
+        acc.approvePhlimbo(100e18);
+        assertEq(usdtToken.allowance(address(acc), address(phlimboMock)), 100e18, "First approve should set allowance");
+
+        // Simulate Phlimbo partially consuming the allowance.
+        // Mint tokens to accumulator and have Phlimbo pull 60 of the 100 approved.
+        usdtToken.mint(address(acc), 100e18);
+
+        // Phlimbo calls transferFrom via collectReward to pull 60e18
+        // We need to prank as the accumulator to call collectReward
+        // Instead, directly simulate: Phlimbo calls transferFrom on the USDT token
+        vm.prank(address(phlimboMock));
+        usdtToken.transferFrom(address(acc), address(phlimboMock), 60e18);
+
+        // Verify residual allowance is non-zero (100 - 60 = 40)
+        uint256 residual = usdtToken.allowance(address(acc), address(phlimboMock));
+        assertEq(residual, 40e18, "Residual allowance should be 40e18 after partial consumption");
+
+        // Second approvePhlimbo: with raw approve() this would revert (40e18 -> 100e18)
+        // With forceApprove(), it should succeed (40e18 -> 0 -> 100e18)
+        acc.approvePhlimbo(100e18);
+
+        assertEq(usdtToken.allowance(address(acc), address(phlimboMock)), 100e18, "Second approvePhlimbo should succeed with forceApprove");
+    }
+
+    /**
+     * @notice Test that forceApprove pattern works correctly with MockUSDT.
+     * @dev Validates that the approve-to-zero-then-to-new-value pattern handles
+     *      USDT's non-standard behavior. Demonstrates the MockUSDT reverts on
+     *      non-zero-to-non-zero and that the forceApprove workaround succeeds.
+     */
+    function test_forceApprove_PatternWorksCorrectly_WithUSDTMock() public {
+        MockUSDT usdtToken = new MockUSDT("USDT", "USDT");
+        usdtToken.mint(address(this), 1000e18);
+
+        address spender = makeAddr("spender");
+
+        // First approve (0 -> non-zero): should work
+        usdtToken.approve(spender, 100e18);
+        assertEq(usdtToken.allowance(address(this), spender), 100e18);
+
+        // Raw non-zero-to-non-zero approve: should revert
+        vm.expectRevert("USDT: approve from non-zero to non-zero");
+        usdtToken.approve(spender, 200e18);
+
+        // forceApprove pattern: approve to 0 first, then to new value
+        usdtToken.approve(spender, 0);
+        assertEq(usdtToken.allowance(address(this), spender), 0);
+
+        usdtToken.approve(spender, 200e18);
+        assertEq(usdtToken.allowance(address(this), spender), 200e18, "forceApprove pattern works");
     }
 
     function test_configurationUpdate_TargetPriceChange() public {

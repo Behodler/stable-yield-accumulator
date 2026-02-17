@@ -479,7 +479,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
 
-        IERC20(rewardToken).approve(phlimbo, amount);
+        IERC20(rewardToken).forceApprove(phlimbo, amount);
     }
 
     /*//////////////////////////////////////////////////////////////

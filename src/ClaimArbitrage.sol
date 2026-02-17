@@ -181,7 +181,7 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         // receive full-value mixed stablecoins as real ERC20 tokens.
         // (audit-5 M-01 fix: approve the current reward token, not hardcoded USDC)
         // ──────────────────────────────────────────────────────────
-        IERC20(rewardToken_).approve(address(sya), p.rewardTokenNeeded);
+        IERC20(rewardToken_).forceApprove(address(sya), p.rewardTokenNeeded);
         sya.claim();
 
         // ──────────────────────────────────────────────────────────
