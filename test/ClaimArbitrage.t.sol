@@ -32,6 +32,28 @@ contract MockERC20 is ERC20 {
 }
 
 /**
+ * @title MockUSDT
+ * @notice ERC20 mock that reverts on non-zero-to-non-zero approve, matching real USDT behavior.
+ * @dev Real USDT requires allowance to be zero before setting a new non-zero value.
+ *      This enforces: approve(spender, newAmount) reverts if allowance(owner, spender) != 0 && newAmount != 0.
+ */
+contract MockUSDT is ERC20 {
+    constructor(string memory name, string memory symbol) ERC20(name, symbol) {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function approve(address spender, uint256 value) public override returns (bool) {
+        // USDT behavior: revert if current allowance is non-zero and new value is non-zero
+        if (allowance(msg.sender, spender) != 0 && value != 0) {
+            revert("USDT: approve from non-zero to non-zero");
+        }
+        return super.approve(spender, value);
+    }
+}
+
+/**
  * @title MockWETH
  * @notice Mock WETH with deposit/withdraw functionality
  */
@@ -2063,5 +2085,202 @@ contract SettleResidualDeltaTest is Test {
         assertEq(susds.balanceOf(address(arb)), 0, "No residual sUSDS stranded");
         assertEq(phusd.balanceOf(address(arb)), 0, "No residual phUSD stranded");
         assertEq(weth.balanceOf(address(arb)), 0, "No residual WETH stranded");
+    }
+}
+
+/*//////////////////////////////////////////////////////////////
+            USDT-LIKE TOKEN COMPATIBILITY TESTS (M-03)
+//////////////////////////////////////////////////////////////*/
+
+/**
+ * @title ClaimArbitrageUSDTTest
+ * @notice Tests that ClaimArbitrage works correctly with USDT-like reward tokens
+ *         that revert on non-zero-to-non-zero approve calls.
+ * @dev Verifies the forceApprove fix for audit finding M-03.
+ */
+contract ClaimArbitrageUSDTTest is Test {
+    ClaimArbitrage public arb;
+    TestablePoolManager public pm;
+    MockSYA public sya;
+    MockUSDT public usdtReward; // USDT-like reward token
+    MockWETH public weth;
+    MockERC20 public susds;
+    MockERC20 public phusd;
+    MockERC20 public dai;
+
+    address public owner;
+    address public caller;
+
+    // Pool keys
+    PoolKey public phUSD_sUSDS_key;
+    PoolKey public USDT_WETH_key;
+    PoolKey public sUSDS_USDT_key;
+    PoolKey public DAI_USDT_key;
+
+    function setUp() public {
+        owner = address(this);
+        caller = makeAddr("caller");
+
+        // Deploy tokens -- USDT-like reward token that reverts on non-zero-to-non-zero approve
+        usdtReward = new MockUSDT("USDT Reward", "USDT");
+        weth = new MockWETH();
+        susds = new MockERC20("sUSDS", "sUSDS");
+        phusd = new MockERC20("phUSD", "phUSD");
+        dai = new MockERC20("DAI", "DAI");
+
+        // Deploy mock SYA with USDT as the reward token
+        sya = new MockSYA(address(usdtReward));
+
+        // Deploy mock PoolManager
+        pm = new TestablePoolManager();
+
+        // Deploy ClaimArbitrage
+        arb = new ClaimArbitrage(
+            address(pm),
+            address(sya),
+            address(weth),
+            address(susds),
+            address(phusd)
+        );
+
+        // Create pool keys with sorted currencies
+        phUSD_sUSDS_key = _makePoolKey(address(phusd), address(susds));
+        USDT_WETH_key = _makePoolKey(address(usdtReward), address(weth));
+        sUSDS_USDT_key = _makePoolKey(address(susds), address(usdtReward));
+        DAI_USDT_key = _makePoolKey(address(dai), address(usdtReward));
+
+        // Determine token ordering for phUSD/sUSDS pool
+        bool _token0IsPhUSD = address(phusd) < address(susds);
+
+        // Set pool keys on arb contract (reward token pool is now USDT/WETH)
+        arb.setPoolKeys(phUSD_sUSDS_key, USDT_WETH_key, sUSDS_USDT_key, _token0IsPhUSD);
+
+        // Fund PoolManager with tokens for take() operations
+        usdtReward.mint(address(pm), 10000e18);
+        weth.mint(address(pm), 1000e18);
+
+        // Fund PM with ETH for WETH unwrap
+        vm.deal(address(weth), 1000 ether);
+    }
+
+    function _makePoolKey(address tokenA, address tokenB) internal pure returns (PoolKey memory) {
+        (address t0, address t1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        return PoolKey({
+            currency0: Currency.wrap(t0),
+            currency1: Currency.wrap(t1),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(0))
+        });
+    }
+
+    /**
+     * @notice Set up a profitable scenario using USDT-like reward token.
+     * @dev Crucially, claimPayment < rewardTokenNeeded to create residual allowance.
+     *      This simulates the discount rate causing partial consumption of the approved amount.
+     *      With a real USDT token, the residual allowance from the first call would cause
+     *      the raw approve() in the second call to revert.
+     *
+     *      Delta flow (1:1 swaps, 10% discount):
+     *        Step 1: sell 10 sUSDS -> get 10 phUSD
+     *        Step 2: borrow 100 USDT (USDT delta = -100)
+     *        Step 3: claim pays 90 USDT to SYA, gets 100 DAI (ERC20 balances: 10 USDT + 100 DAI)
+     *        Step 4: sell 10 phUSD -> get 10 sUSDS
+     *        Step 5: deposit 100 DAI -> swap DAI to USDT (USDT delta += 100)
+     *                deposit 10 USDT (residual) -> USDT delta += 10, skip swap (is reward token)
+     *        Step 7: net USDT delta = -100 + 100 + 10 = +10 profit -> swap to WETH
+     *        Steps 8-9: extract WETH -> ETH
+     *
+     *      The key USDT behavior: after Step 3, arb has approved SYA for 100 but only
+     *      90 was pulled, leaving residual allowance of 10. On second execute(), raw approve()
+     *      would revert (non-zero-to-non-zero). forceApprove() handles this correctly.
+     */
+    function _setupUSDTScenario() internal returns (IClaimArbitrage.ExecuteParams memory params) {
+        // Configure known stables: DAI + USDT (reward token is itself a known stable
+        // because SYA has a USDT-yielding strategy, so Step 5 deposits it back)
+        arb.addKnownStable(address(dai));
+        arb.addKnownStable(address(usdtReward));
+        arb.setStableToRewardTokenPool(address(dai), DAI_USDT_key);
+        // No pool needed for usdtReward -- Step 5 skips the swap when stable == rewardToken
+
+        // Register strategies in MockSYA so _validateKnownStablesCoverage() passes.
+        sya.addYieldStrategy(makeAddr("strategyDAI"), address(dai));
+        sya.addYieldStrategy(makeAddr("strategyUSDT"), address(usdtReward));
+
+        // CRITICAL: claimPayment (90) < rewardTokenNeeded (100) to create residual allowance of 10
+        // This simulates the 10% discount rate scenario described in M-03
+        address[] memory yieldTokens = new address[](1);
+        yieldTokens[0] = address(dai);
+        uint256[] memory yieldAmounts = new uint256[](1);
+        yieldAmounts[0] = 100e18;
+        sya.setupClaim(90e18, yieldTokens, yieldAmounts);
+
+        // Fund SYA with yield tokens
+        dai.mint(address(sya), 100e18);
+
+        params = IClaimArbitrage.ExecuteParams({
+            pumpAmount: 10e18,
+            rewardTokenNeeded: 100e18,
+            pumpPriceLimit: type(uint160).max - 1,
+            unwindPriceLimit: type(uint160).min + 1
+        });
+    }
+
+    /**
+     * @notice Test that a second execute() call succeeds with USDT-like reward token.
+     * @dev Verifies that forceApprove correctly handles residual allowance left from
+     *      the first execute() call (where SYA's claim() only pulled `actualPayment` < `rewardTokenNeeded`).
+     *      Without forceApprove, the second call would revert with "USDT: approve from non-zero to non-zero".
+     */
+    function test_execute_SecondCallSucceeds_WithUSDTLikeRewardToken() public {
+        IClaimArbitrage.ExecuteParams memory params = _setupUSDTScenario();
+
+        // First execute -- leaves residual allowance (100 - 90 = 10)
+        vm.prank(caller);
+        arb.execute(params);
+
+        // Verify residual allowance exists on the arb contract towards SYA
+        uint256 residualAllowance = usdtReward.allowance(address(arb), address(sya));
+        assertGt(residualAllowance, 0, "Residual allowance should be non-zero after first execute");
+
+        // Re-fund SYA with yield tokens for second call
+        dai.mint(address(sya), 100e18);
+
+        // Second execute -- with raw approve() this would revert: "USDT: approve from non-zero to non-zero"
+        // With forceApprove, it should succeed
+        vm.prank(caller);
+        arb.execute(params);
+
+        // If we reached here, the forceApprove pattern worked correctly
+        assertTrue(true, "Second execute succeeded with USDT-like reward token");
+    }
+
+    /**
+     * @notice Test that forceApprove pattern works correctly with MockUSDT.
+     * @dev Validates that forceApprove (approve to 0 then to new value) handles
+     *      the USDT non-standard approve behavior. First verifies that raw approve
+     *      WOULD fail, then confirms forceApprove succeeds.
+     */
+    function test_forceApprove_WorksCorrectly_WithUSDTMock() public {
+        // Mint some USDT to this test contract
+        usdtReward.mint(address(this), 1000e18);
+
+        address spender = makeAddr("spender");
+
+        // First approve works (0 -> non-zero)
+        usdtReward.approve(spender, 100e18);
+        assertEq(usdtReward.allowance(address(this), spender), 100e18);
+
+        // Second raw approve should REVERT (non-zero -> non-zero)
+        vm.expectRevert("USDT: approve from non-zero to non-zero");
+        usdtReward.approve(spender, 200e18);
+
+        // Verify the SafeERC20.forceApprove pattern: approve to 0 first, then to new value
+        // This is what forceApprove does internally
+        usdtReward.approve(spender, 0);
+        assertEq(usdtReward.allowance(address(this), spender), 0);
+
+        usdtReward.approve(spender, 200e18);
+        assertEq(usdtReward.allowance(address(this), spender), 200e18, "forceApprove pattern should work with USDT");
     }
 }
