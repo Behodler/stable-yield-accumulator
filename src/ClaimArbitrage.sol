@@ -354,7 +354,12 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
     /**
      * @dev If a currency has residual delta (positive or negative), settle it to zero.
      *      - Zero delta: no-op.
-     *      - Positive delta: take excess tokens from PM, then re-deposit them to zero the delta.
+     *      - Positive delta (credit owed by PM to the contract): stay internal to PM's
+     *        delta accounting by swapping the credit to the reward token so it contributes
+     *        to Step 7's profit conversion. If the token IS the reward token, return
+     *        immediately — the positive delta will be picked up by Step 7's currencyDelta
+     *        query. No take() is needed because the credit remains within PM's accounting
+     *        and feeds directly into the profit pipeline (Steps 7-9).
      *      - Negative delta: buy the owed amount via the configured pool (stableToRewardTokenPool,
      *        sUSDS_USDC_pool, or phUSD_sUSDS_pool fallback).
      *
@@ -370,11 +375,43 @@ contract ClaimArbitrage is Ownable, IUnlockCallback, IClaimArbitrage {
         if (d == 0) return;
 
         if (d > 0) {
-            // Positive delta: the contract has a credit in PoolManager.
-            // take() converts the credit into real tokens, zeroing the delta.
-            // The tokens remain in the contract and can be used in subsequent
-            // operations or rescued via rescueToken().
-            poolManager.take(Currency.wrap(token), address(this), uint256(d));
+            // Positive delta: credit owed by PM to the contract.
+            // Stay internal to PM's delta accounting — swap the credit to the
+            // reward token so it contributes to Step 7's profit conversion.
+            address rewardToken_ = sya.rewardToken();
+            if (token == rewardToken_) {
+                // Already in reward-token denomination. The positive delta
+                // will be picked up by Step 7's currencyDelta query.
+                return;
+            }
+
+            // Swap the positive credit to reward token within PM.
+            // The positive delta IS the input — no take() or deposit needed.
+            PoolKey memory pool = stableToRewardTokenPool[token];
+            if (Currency.unwrap(pool.currency0) == address(0)
+                && Currency.unwrap(pool.currency1) == address(0))
+            {
+                if (token == sUSDS) {
+                    pool = sUSDS_USDC_pool;
+                } else if (token == phUSD) {
+                    pool = phUSD_sUSDS_pool;
+                } else {
+                    revert UnsettledResidualForUnconfiguredToken(token);
+                }
+            }
+
+            bool tokenIsToken0 = (Currency.unwrap(pool.currency0) == token);
+            poolManager.swap(
+                pool,
+                SwapParams({
+                    zeroForOne: tokenIsToken0,
+                    amountSpecified: -int256(uint256(d)), // exact input: sell the positive delta
+                    sqrtPriceLimitX96: tokenIsToken0
+                        ? type(uint160).min + 1
+                        : type(uint160).max - 1
+                }),
+                ""
+            );
             return;
         }
 
