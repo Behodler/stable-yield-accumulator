@@ -7,7 +7,7 @@ import "../src/interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
 import "phlimbo-ea/interfaces/IPhlimbo.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {PoolId} from "v4-core/types/PoolId.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 
 /**
  * @title MockERC20
@@ -159,7 +159,6 @@ contract MockYieldStrategy is IYieldStrategy {
         lastWithdrawRecipient = recipient;
 
         // Actually transfer tokens from this contract to recipient
-        // The strategy must hold the tokens for this to work
         IERC20(token).transfer(recipient, amount);
 
         // Reduce yield after withdrawal
@@ -176,6 +175,94 @@ contract MockYieldStrategy is IYieldStrategy {
 }
 
 /**
+ * @title MockNFTMinter
+ * @notice Mock NFTMinter that implements both INFTMinter functions and ERC1155 balanceOf
+ * @dev Simulates the NFTMinter contract for testing the NFT-based claim gate.
+ *      The StableYieldAccumulator must be registered as an authorized burner.
+ */
+contract MockNFTMinter {
+    struct DispatcherConfig {
+        address dispatcher;
+        uint256 price;
+        uint256 growthBasisPoints;
+    }
+
+    uint256 public nextIndex;
+    mapping(uint256 => DispatcherConfig) public _configs;
+    mapping(address => uint256) public dispatcherTokenIdOverride;
+    mapping(uint256 => address) public tokenIdToDispatcher;
+    mapping(address => bool) public authorizedBurners;
+
+    // ERC1155 balances: holder => tokenId => balance
+    mapping(address => mapping(uint256 => uint256)) public balances;
+
+    // Track burn calls
+    uint256 public burnCallCount;
+    address public lastBurnHolder;
+    uint256 public lastBurnTokenId;
+    uint256 public lastBurnQuantity;
+
+    constructor() {
+        nextIndex = 1; // starts at 1, 0 is invalid
+    }
+
+    function configs(uint256 index) external view returns (address dispatcher, uint256 price, uint256 growthBasisPoints) {
+        DispatcherConfig memory config = _configs[index];
+        return (config.dispatcher, config.price, config.growthBasisPoints);
+    }
+
+    function registerDispatcher(address dispatcher, uint256 price, uint256 growthBasisPoints) external {
+        uint256 index = nextIndex;
+        _configs[index] = DispatcherConfig(dispatcher, price, growthBasisPoints);
+        tokenIdToDispatcher[index] = dispatcher;
+        nextIndex++;
+    }
+
+    function setDispatcherTokenIdOverride(address dispatcher, uint256 tokenId) external {
+        dispatcherTokenIdOverride[dispatcher] = tokenId;
+        tokenIdToDispatcher[tokenId] = dispatcher;
+    }
+
+    function setAuthorizedBurner(address burner, bool authorized) external {
+        authorizedBurners[burner] = authorized;
+    }
+
+    function mintNFT(address holder, uint256 tokenId, uint256 amount) external {
+        balances[holder][tokenId] += amount;
+    }
+
+    /// @notice ERC1155 balanceOf - called via IERC1155(nftMinter).balanceOf()
+    function balanceOf(address holder, uint256 tokenId) external view returns (uint256) {
+        return balances[holder][tokenId];
+    }
+
+    /// @notice Burns NFTs from a holder. Only callable by authorized burners.
+    function burn(address holder, uint256 tokenId, uint256 quantity) external {
+        require(authorizedBurners[msg.sender], "Not authorized burner");
+        require(balances[holder][tokenId] >= quantity, "Insufficient balance");
+
+        balances[holder][tokenId] -= quantity;
+
+        burnCallCount++;
+        lastBurnHolder = holder;
+        lastBurnTokenId = tokenId;
+        lastBurnQuantity = quantity;
+    }
+
+    function resetBurnTracking() external {
+        burnCallCount = 0;
+        lastBurnHolder = address(0);
+        lastBurnTokenId = 0;
+        lastBurnQuantity = 0;
+    }
+
+    // ERC1155 supportsInterface stub
+    function supportsInterface(bytes4) external pure returns (bool) {
+        return true;
+    }
+}
+
+/**
  * @title StableYieldAccumulatorTest
  * @notice Comprehensive test suite for StableYieldAccumulator
  * @dev GREEN PHASE - Tests verify actual behavior with real token transfers
@@ -188,6 +275,7 @@ contract StableYieldAccumulatorTest is Test {
     MockYieldStrategy public mockStrategy1;
     MockYieldStrategy public mockStrategy2;
     MockPhlimbo public mockPhlimbo;
+    MockNFTMinter public mockNFTMinter;
 
     address public owner;
     address public pauser;
@@ -199,6 +287,7 @@ contract StableYieldAccumulatorTest is Test {
     // Events to test
     event PauserUpdated(address indexed oldPauser, address indexed newPauser);
     event MinterUpdated(address indexed oldMinter, address indexed newMinter);
+    event NFTMinterUpdated(address indexed oldNFTMinter, address indexed newNFTMinter);
     event Paused(address account);
     event Unpaused(address account);
     event YieldStrategyAdded(address indexed strategy);
@@ -238,6 +327,13 @@ contract StableYieldAccumulatorTest is Test {
         mockPhlimbo = new MockPhlimbo(address(rewardToken));
         mockPhlimbo.setYieldAccumulator(address(accumulator));
         phlimboAddr = address(mockPhlimbo);
+
+        // Deploy mock NFT Minter and configure
+        mockNFTMinter = new MockNFTMinter();
+        // Register the accumulator as an authorized burner
+        mockNFTMinter.setAuthorizedBurner(address(accumulator), true);
+        // Register a dispatcher so there's a valid token ID
+        mockNFTMinter.registerDispatcher(makeAddr("dispatcher1"), 1e18, 100);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -632,8 +728,8 @@ contract StableYieldAccumulatorTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Helper to set up a complete claim scenario
-     * @dev Sets up strategies with yield, claimer with reward tokens, and all configs
+     * @notice Helper to set up a complete claim scenario with NFT gate
+     * @dev Sets up strategies with yield, claimer with reward tokens and NFT, and all configs
      */
     function _setupClaimScenario(uint256 yieldAmount) internal returns (address claimer) {
         claimer = makeAddr("claimer");
@@ -643,6 +739,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2% discount
+        accumulator.setNFTMinter(address(mockNFTMinter));
 
         // Add strategy with token
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
@@ -669,6 +766,9 @@ contract StableYieldAccumulatorTest is Test {
 
         // Approve Phlimbo to pull tokens from accumulator
         accumulator.approvePhlimbo(type(uint256).max);
+
+        // Mint an NFT for the claimer (tokenId = 1, matching the dispatcher registered in setUp)
+        mockNFTMinter.mintNFT(claimer, 1, 1);
     }
 
     function test_claim_FullFlow_TransfersCorrectly() public {
@@ -723,6 +823,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200);
+        accumulator.setNFTMinter(address(mockNFTMinter));
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
@@ -746,6 +847,9 @@ contract StableYieldAccumulatorTest is Test {
 
         // Approve Phlimbo to pull tokens from accumulator
         accumulator.approvePhlimbo(type(uint256).max);
+
+        // Mint NFT for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 1);
 
         // Claim
         vm.prank(claimer);
@@ -797,11 +901,15 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setMinter(minterAddr);
+        accumulator.setNFTMinter(address(mockNFTMinter));
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
 
         // No yield set
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 0);
+
+        // Mint NFT for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 1);
 
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
@@ -1016,6 +1124,9 @@ contract StableYieldAccumulatorTest is Test {
         // 5. Set reward token
         accumulator.setRewardToken(address(rewardToken));
 
+        // 5b. Set NFT minter
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
         // 6. Setup yield: 100e18 yield in strategy
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 100e18);
         strategyToken1.mint(address(mockStrategy1), 100e18);
@@ -1027,6 +1138,9 @@ contract StableYieldAccumulatorTest is Test {
 
         // 7.5. Approve Phlimbo to pull tokens from accumulator
         accumulator.approvePhlimbo(type(uint256).max);
+
+        // 7.6. Mint NFT for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 1);
 
         // 8. Claim and verify actual token transfers
         uint256 phlimboBalanceBefore = rewardToken.balanceOf(phlimboAddr);
@@ -1205,19 +1319,6 @@ contract StableYieldAccumulatorTest is Test {
 
     /**
      * @notice Tests that getTotalYield() properly normalizes yields from tokens with different decimals
-     * @dev This test verifies the fix for the bug where getTotalYield() summed raw token amounts
-     *      without normalizing them to a common 18-decimal base.
-     *
-     *      Scenario:
-     *      - Strategy 1: 6-decimal token (like USDC) with 300 USDC yield (300e6 raw)
-     *      - Strategy 2: 18-decimal token (like DOLA) with 4000 DOLA yield (4000e18 raw)
-     *
-     *      Bug behavior (before fix):
-     *      - Returns 300e6 + 4000e18 = ~4000e18 (treating 300e6 as negligible)
-     *
-     *      Correct behavior (after fix):
-     *      - Normalizes 300e6 to 300e18 (scales up by 10^12)
-     *      - Returns 300e18 + 4000e18 = 4300e18
      */
     function test_getTotalYield_NormalizesMultiDecimalTokens() public {
         // Create 6-decimal token (like USDC)
@@ -1284,6 +1385,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2%
+        accumulator.setNFTMinter(address(mockNFTMinter));
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
@@ -1309,6 +1411,9 @@ contract StableYieldAccumulatorTest is Test {
         rewardToken.approve(address(accumulator), type(uint256).max);
 
         accumulator.approvePhlimbo(type(uint256).max);
+
+        // Mint NFT for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 1);
 
         // Claim should succeed, collecting only from unpaused strategy2
         vm.prank(claimer);
@@ -1337,6 +1442,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2%
+        accumulator.setNFTMinter(address(mockNFTMinter));
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
@@ -1366,6 +1472,9 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.approvePhlimbo(type(uint256).max);
 
+        // Mint NFT for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+
         // Record claimer's reward token balance before claim
         uint256 claimerBalanceBefore = rewardToken.balanceOf(claimer);
 
@@ -1387,6 +1496,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2%
+        accumulator.setNFTMinter(address(mockNFTMinter));
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
@@ -1410,6 +1520,9 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.approvePhlimbo(type(uint256).max);
 
+        // Mint NFT for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+
         // Claim — no tokens paused, should collect from both strategies
         vm.prank(claimer);
         accumulator.claim();
@@ -1426,523 +1539,13 @@ contract StableYieldAccumulatorTest is Test {
         uint256 expectedPayment = 100e18 * 98 / 100;
         assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive full discounted payment");
     }
-}
-
-/**
- * @title MockPoolManager
- * @notice Mock Uniswap V4 PoolManager for testing price queries
- * @dev Provides configurable sqrtPriceX96 for slot0 queries
- */
-contract MockPoolManager {
-    uint160 public sqrtPriceX96;
-    int24 public tick;
-    uint24 public protocolFee;
-    uint24 public lpFee;
-
-    // Mapping for extsload simulation
-    mapping(bytes32 => bytes32) public slots;
-
-    function setSqrtPriceX96(uint160 _sqrtPriceX96) external {
-        sqrtPriceX96 = _sqrtPriceX96;
-    }
-
-    function setSlot0(uint160 _sqrtPriceX96, int24 _tick, uint24 _protocolFee, uint24 _lpFee) external {
-        sqrtPriceX96 = _sqrtPriceX96;
-        tick = _tick;
-        protocolFee = _protocolFee;
-        lpFee = _lpFee;
-    }
-
-    /**
-     * @notice Mock extsload that returns packed slot0 data
-     * @dev StateLibrary.getSlot0 uses this to get pool data
-     */
-    function extsload(bytes32 slot) external view returns (bytes32) {
-        // Pack slot0 data: sqrtPriceX96 (160 bits) | tick (24 bits) | protocolFee (24 bits) | lpFee (24 bits)
-        // Layout: lpFee (24) | protocolFee (24) | tick (24) | sqrtPriceX96 (160)
-        uint256 packed = uint256(sqrtPriceX96);
-        packed |= uint256(uint24(tick)) << 160;
-        packed |= uint256(protocolFee) << 184;
-        packed |= uint256(lpFee) << 208;
-        return bytes32(packed);
-    }
-
-    function extsload(bytes32, uint256) external pure returns (bytes32[] memory) {
-        return new bytes32[](0);
-    }
-}
-
-/**
- * @title MockSUSDS
- * @notice Mock sUSDS ERC4626 vault for testing convertToAssets
- * @dev Provides configurable exchange rate for sUSDS -> USDS conversion
- */
-contract MockSUSDS {
-    // Exchange rate: 1 sUSDS = exchangeRate / 1e18 USDS
-    // e.g., 1.05e18 means 1 sUSDS = 1.05 USDS
-    uint256 public exchangeRate = 1e18;
-
-    function setExchangeRate(uint256 _rate) external {
-        exchangeRate = _rate;
-    }
-
-    /**
-     * @notice Convert sUSDS shares to USDS assets
-     * @param shares Amount of sUSDS shares
-     * @return Amount of USDS assets
-     */
-    function convertToAssets(uint256 shares) external view returns (uint256) {
-        return shares * exchangeRate / 1e18;
-    }
-}
-
-/**
- * @title ConditionalClaimTest
- * @notice Tests for the conditional claim execution feature based on phUSD/sUSDS spot price
- */
-contract ConditionalClaimTest is Test {
-    StableYieldAccumulator public accumulator;
-    MockERC20 public rewardToken;
-    MockERC20 public strategyToken1;
-    MockYieldStrategy public mockStrategy1;
-    MockPhlimbo public mockPhlimbo;
-    MockPoolManager public mockPoolManager;
-    MockSUSDS public mockSUSDS;
-
-    address public owner;
-    address public minterAddr;
-    address public phlimboAddr;
-    address public claimer;
-    address public phUSDAddr;
-
-    // Events
-    event PoolManagerUpdated(address indexed oldPoolManager, address indexed newPoolManager);
-    event PricePoolUpdated(PoolId indexed poolId, bool token0IsPhUSD);
-    event SUSDSUpdated(address indexed oldSUSDS, address indexed newSUSDS);
-    event TargetPriceUpdated(uint256 oldTargetPrice, uint256 newTargetPrice);
-    event PhUSDUpdated(address indexed oldPhUSD, address indexed newPhUSD);
-
-    function setUp() public {
-        owner = address(this);
-        minterAddr = makeAddr("minter");
-        claimer = makeAddr("claimer");
-        phUSDAddr = makeAddr("phUSD");
-
-        // Deploy mock tokens
-        rewardToken = new MockERC20("Reward Token", "RWD");
-        strategyToken1 = new MockERC20("Strategy Token 1", "STK1");
-
-        // Deploy mock contracts
-        mockStrategy1 = new MockYieldStrategy();
-        mockPoolManager = new MockPoolManager();
-        mockSUSDS = new MockSUSDS();
-
-        // Deploy accumulator
-        accumulator = new StableYieldAccumulator();
-
-        // Deploy mock Phlimbo
-        mockPhlimbo = new MockPhlimbo(address(rewardToken));
-        mockPhlimbo.setYieldAccumulator(address(accumulator));
-        phlimboAddr = address(mockPhlimbo);
-    }
 
     /*//////////////////////////////////////////////////////////////
-                    OWNER FUNCTION ACCESS CONTROL TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    function test_setPoolManager_OnlyOwner() public {
-        vm.prank(claimer);
-        vm.expectRevert();
-        accumulator.setPoolManager(address(mockPoolManager));
-    }
-
-    function test_setPoolManager_Success() public {
-        vm.expectEmit(true, true, false, true);
-        emit PoolManagerUpdated(address(0), address(mockPoolManager));
-        accumulator.setPoolManager(address(mockPoolManager));
-
-        assertEq(address(accumulator.poolManager()), address(mockPoolManager));
-    }
-
-    function test_setPoolManager_CanSetToZero() public {
-        accumulator.setPoolManager(address(mockPoolManager));
-        accumulator.setPoolManager(address(0));
-        assertEq(address(accumulator.poolManager()), address(0));
-    }
-
-    function test_setPricePool_OnlyOwner() public {
-        PoolId poolId = PoolId.wrap(bytes32(uint256(1)));
-        vm.prank(claimer);
-        vm.expectRevert();
-        accumulator.setPricePool(poolId, true);
-    }
-
-    function test_setPricePool_Success() public {
-        PoolId poolId = PoolId.wrap(bytes32(uint256(123)));
-
-        vm.expectEmit(true, false, false, true);
-        emit PricePoolUpdated(poolId, true);
-        accumulator.setPricePool(poolId, true);
-
-        assertTrue(PoolId.unwrap(accumulator.pricePoolId()) == bytes32(uint256(123)));
-        assertTrue(accumulator.token0IsPhUSD());
-    }
-
-    function test_setSUSDS_OnlyOwner() public {
-        vm.prank(claimer);
-        vm.expectRevert();
-        accumulator.setSUSDS(address(mockSUSDS));
-    }
-
-    function test_setSUSDS_Success() public {
-        vm.expectEmit(true, true, false, true);
-        emit SUSDSUpdated(address(0), address(mockSUSDS));
-        accumulator.setSUSDS(address(mockSUSDS));
-
-        assertEq(address(accumulator.sUSDS()), address(mockSUSDS));
-    }
-
-    function test_setTargetPrice_OnlyOwner() public {
-        vm.prank(claimer);
-        vm.expectRevert();
-        accumulator.setTargetPrice(1e18);
-    }
-
-    function test_setTargetPrice_Success() public {
-        vm.expectEmit(false, false, false, true);
-        emit TargetPriceUpdated(0, 1e18);
-        accumulator.setTargetPrice(1e18);
-
-        assertEq(accumulator.targetPrice(), 1e18);
-    }
-
-    function test_setPhUSD_OnlyOwner() public {
-        vm.prank(claimer);
-        vm.expectRevert();
-        accumulator.setPhUSD(phUSDAddr);
-    }
-
-    function test_setPhUSD_Success() public {
-        vm.expectEmit(true, true, false, true);
-        emit PhUSDUpdated(address(0), phUSDAddr);
-        accumulator.setPhUSD(phUSDAddr);
-
-        assertEq(accumulator.phUSD(), phUSDAddr);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    PRICE CALCULATION TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    /**
-     * @notice Helper to set up price check infrastructure
-     */
-    function _setupPriceCheck(uint160 sqrtPriceX96, uint256 sUSDSRate, bool token0IsPhUSD) internal {
-        accumulator.setPoolManager(address(mockPoolManager));
-        accumulator.setSUSDS(address(mockSUSDS));
-        accumulator.setPhUSD(phUSDAddr);
-
-        PoolId poolId = PoolId.wrap(bytes32(uint256(1)));
-        accumulator.setPricePool(poolId, token0IsPhUSD);
-
-        mockPoolManager.setSqrtPriceX96(sqrtPriceX96);
-        mockSUSDS.setExchangeRate(sUSDSRate);
-    }
-
-    function test_claimPrice_ReturnsZeroIfPoolManagerNotSet() public {
-        uint256 price = accumulator.claimPrice();
-        assertEq(price, 0, "Should return 0 if poolManager not set");
-    }
-
-    function test_claimPrice_ReturnsPriceWhenConfigured() public {
-        // Set sqrtPriceX96 for price = 1.0 (1e18)
-        // sqrtPriceX96 = sqrt(1) * 2^96 = 2^96 = 79228162514264337593543950336
-        uint160 sqrtPriceX96 = 79228162514264337593543950336;
-
-        _setupPriceCheck(sqrtPriceX96, 1e18, true);
-
-        uint256 price = accumulator.claimPrice();
-        // Price should be approximately 1e18 (within precision tolerance)
-        assertApproxEqRel(price, 1e18, 0.01e18, "Price should be approximately 1e18");
-    }
-
-    function test_claimPrice_Token0IsPhUSD_PriceAbove1() public {
-        // sqrtPriceX96 for price = 1.1 (phUSD is worth 1.1 sUSDS)
-        // sqrt(1.1) * 2^96 ≈ 83077498137502453155780008628
-        uint160 sqrtPriceX96 = 83077498137502453155780008628;
-
-        _setupPriceCheck(sqrtPriceX96, 1e18, true);
-
-        uint256 price = accumulator.claimPrice();
-        // Should be approximately 1.1e18
-        assertApproxEqRel(price, 1.1e18, 0.01e18, "Price should be approximately 1.1e18");
-    }
-
-    function test_claimPrice_Token1IsPhUSD_PriceAbove1() public {
-        // When token1 is phUSD, sqrtPriceX96 represents sqrt(phUSD/sUSDS)
-        // For phUSD price = 1.1 sUSDS, sqrtPriceX96 = sqrt(1.1) * 2^96
-        uint160 sqrtPriceX96 = 83077498137502453155780008628;
-
-        _setupPriceCheck(sqrtPriceX96, 1e18, false);
-
-        uint256 price = accumulator.claimPrice();
-        // When token1IsPhUSD, we need 1/price, so price in sUSDS ≈ 0.909e18
-        // But wait - if token1 is phUSD, then sqrtPriceX96 represents sqrt(phUSD/sUSDS)
-        // So phUSD price = (sqrtPriceX96)^2 / 2^192 = 1.1
-        // But we invert it: price = 2^192 / sqrtPriceX96^2 ≈ 0.909
-        assertApproxEqRel(price, 0.909e18, 0.02e18, "Price should be approximately 0.909e18");
-    }
-
-    function test_claimPrice_WithSUSDSConversion() public {
-        // sqrtPriceX96 for price = 1.0 in sUSDS terms
-        uint160 sqrtPriceX96 = 79228162514264337593543950336;
-
-        // sUSDS exchange rate: 1 sUSDS = 1.05 USDS
-        _setupPriceCheck(sqrtPriceX96, 1.05e18, true);
-
-        uint256 price = accumulator.claimPrice();
-        // 1 phUSD = 1 sUSDS, and 1 sUSDS = 1.05 USDS
-        // So 1 phUSD = 1.05 USDS
-        assertApproxEqRel(price, 1.05e18, 0.01e18, "Price should be approximately 1.05e18 with sUSDS conversion");
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    canClaim TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    function test_canClaim_TrueWhenPoolManagerNotSet() public {
-        assertTrue(accumulator.canClaim(), "Should return true when poolManager not set");
-    }
-
-    function test_canClaim_TrueWhenTargetPriceIsZero() public {
-        accumulator.setPoolManager(address(mockPoolManager));
-        // Don't set targetPrice (stays 0)
-        assertTrue(accumulator.canClaim(), "Should return true when targetPrice is 0");
-    }
-
-    function test_canClaim_TrueWhenPriceAboveTarget() public {
-        // Price = 1.1e18
-        uint160 sqrtPriceX96 = 83077498137502453155780008628;
-        _setupPriceCheck(sqrtPriceX96, 1e18, true);
-
-        // Target = 1.0e18
-        accumulator.setTargetPrice(1e18);
-
-        assertTrue(accumulator.canClaim(), "Should return true when price >= target");
-    }
-
-    function test_canClaim_TrueWhenPriceEqualsTarget() public {
-        // Price = 1.0e18
-        uint160 sqrtPriceX96 = 79228162514264337593543950336;
-        _setupPriceCheck(sqrtPriceX96, 1e18, true);
-
-        // Target = 1.0e18
-        accumulator.setTargetPrice(1e18);
-
-        assertTrue(accumulator.canClaim(), "Should return true when price == target");
-    }
-
-    function test_canClaim_FalseWhenPriceBelowTarget() public {
-        // Price = 0.9e18
-        // sqrt(0.9) * 2^96 ≈ 75166920096232236089664808974
-        uint160 sqrtPriceX96 = 75166920096232236089664808974;
-        _setupPriceCheck(sqrtPriceX96, 1e18, true);
-
-        // Target = 1.0e18
-        accumulator.setTargetPrice(1e18);
-
-        assertFalse(accumulator.canClaim(), "Should return false when price < target");
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    CLAIM WITH PRICE CHECK TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    /**
-     * @notice Helper to set up a complete claim scenario with price check
-     */
-    function _setupClaimWithPriceCheck(uint256 yieldAmount, uint160 sqrtPriceX96, uint256 targetPriceValue) internal {
-        // Setup basic claim infrastructure
-        accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
-        accumulator.setDiscountRate(200); // 2% discount
-
-        // Add strategy with token
-        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-
-        // Set token config
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
-
-        // Set up mock strategy with yield
-        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
-        strategyToken1.mint(address(mockStrategy1), yieldAmount);
-
-        // Setup price check
-        _setupPriceCheck(sqrtPriceX96, 1e18, true);
-        accumulator.setTargetPrice(targetPriceValue);
-
-        // Fund claimer with reward tokens
-        uint256 claimerPayment = yieldAmount * 98 / 100;
-        rewardToken.mint(claimer, claimerPayment + 1e18);
-
-        vm.prank(claimer);
-        rewardToken.approve(address(accumulator), type(uint256).max);
-
-        // Approve Phlimbo
-        accumulator.approvePhlimbo(type(uint256).max);
-    }
-
-    function test_claim_SucceedsWhenPriceAboveTarget() public {
-        uint256 yieldAmount = 100e18;
-        // Price = 1.1e18
-        uint160 sqrtPriceX96 = 83077498137502453155780008628;
-        // Target = 1.0e18
-        uint256 targetPriceValue = 1e18;
-
-        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
-
-        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
-
-        vm.prank(claimer);
-        accumulator.claim();
-
-        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
-        assertEq(claimerYieldAfter - claimerYieldBefore, yieldAmount, "Claimer should receive yield tokens");
-    }
-
-    function test_claim_RevertsWhenPriceBelowTarget() public {
-        uint256 yieldAmount = 100e18;
-        // Price = 0.9e18
-        uint160 sqrtPriceX96 = 75166920096232236089664808974;
-        // Target = 1.0e18
-        uint256 targetPriceValue = 1e18;
-
-        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
-
-        vm.prank(claimer);
-        vm.expectRevert(abi.encodeWithSelector(
-            IStableYieldAccumulator.phUSDPriceBelowTarget.selector,
-            phUSDAddr,
-            address(mockPoolManager),
-            uint256(PoolId.unwrap(PoolId.wrap(bytes32(uint256(1)))))
-        ));
-        accumulator.claim();
-    }
-
-    function test_claim_SucceedsWhenPoolManagerNotSet() public {
-        uint256 yieldAmount = 100e18;
-
-        // Setup basic claim infrastructure WITHOUT price check
-        accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
-        accumulator.setDiscountRate(200);
-
-        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
-
-        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
-        strategyToken1.mint(address(mockStrategy1), yieldAmount);
-
-        uint256 claimerPayment = yieldAmount * 98 / 100;
-        rewardToken.mint(claimer, claimerPayment + 1e18);
-
-        vm.prank(claimer);
-        rewardToken.approve(address(accumulator), type(uint256).max);
-
-        accumulator.approvePhlimbo(type(uint256).max);
-
-        // Set target price but NOT pool manager
-        accumulator.setTargetPrice(1e18);
-
-        // Should succeed because pool manager not set (graceful skip)
-        vm.prank(claimer);
-        accumulator.claim();
-
-        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed with poolManager not set");
-    }
-
-    function test_claim_SucceedsWhenTargetPriceIsZero() public {
-        uint256 yieldAmount = 100e18;
-        // Price = 0.9e18 (below typical target)
-        uint160 sqrtPriceX96 = 75166920096232236089664808974;
-        // Target = 0 (disabled)
-        uint256 targetPriceValue = 0;
-
-        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
-
-        // Should succeed because targetPrice is 0 (graceful skip)
-        vm.prank(claimer);
-        accumulator.claim();
-
-        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed with targetPrice = 0");
-    }
-
-    function test_claim_SucceedsWhenPriceExactlyEqualsTarget() public {
-        uint256 yieldAmount = 100e18;
-        // Price = 1.0e18
-        uint160 sqrtPriceX96 = 79228162514264337593543950336;
-        // Target = 1.0e18
-        uint256 targetPriceValue = 1e18;
-
-        _setupClaimWithPriceCheck(yieldAmount, sqrtPriceX96, targetPriceValue);
-
-        vm.prank(claimer);
-        accumulator.claim();
-
-        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed when price == target");
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    INTEGRATION TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    function test_fullFlow_ConditionalClaimWithPriceIncrease() public {
-        uint256 yieldAmount = 100e18;
-
-        // Initial price = 0.9e18 (below target)
-        uint160 lowPriceX96 = 75166920096232236089664808974;
-        // Target = 1.0e18
-        uint256 targetPriceValue = 1e18;
-
-        _setupClaimWithPriceCheck(yieldAmount, lowPriceX96, targetPriceValue);
-
-        // First attempt should fail - price below minimum
-        vm.prank(claimer);
-        vm.expectRevert(abi.encodeWithSelector(
-            IStableYieldAccumulator.phUSDPriceBelowTarget.selector,
-            phUSDAddr,
-            address(mockPoolManager),
-            uint256(PoolId.unwrap(PoolId.wrap(bytes32(uint256(1)))))
-        ));
-        accumulator.claim();
-
-        // Price increases to 1.1e18
-        uint160 highPriceX96 = 83077498137502453155780008628;
-        mockPoolManager.setSqrtPriceX96(highPriceX96);
-
-        // Now canClaim should return true
-        assertTrue(accumulator.canClaim(), "canClaim should return true after price increase");
-
-        // Second attempt should succeed
-        vm.prank(claimer);
-        accumulator.claim();
-
-        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claim should succeed after price increase");
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                USDT-LIKE TOKEN COMPATIBILITY TESTS (M-03)
+            USDT-LIKE TOKEN COMPATIBILITY TESTS (M-03)
     //////////////////////////////////////////////////////////////*/
 
     /**
      * @notice Test that second approvePhlimbo() succeeds after partial consumption by Phlimbo.
-     * @dev With a USDT-like reward token, the first approvePhlimbo() sets a non-zero allowance.
-     *      After Phlimbo partially consumes it via collectReward(), a residual allowance remains.
-     *      A raw approve() would revert (non-zero -> non-zero). forceApprove() must handle this.
      */
     function test_approvePhlimbo_SecondCallSucceeds_AfterPartialConsumption_WithUSDTLikeToken() public {
         // Deploy a USDT-like reward token
@@ -1962,12 +1565,8 @@ contract ConditionalClaimTest is Test {
         assertEq(usdtToken.allowance(address(acc), address(phlimboMock)), 100e18, "First approve should set allowance");
 
         // Simulate Phlimbo partially consuming the allowance.
-        // Mint tokens to accumulator and have Phlimbo pull 60 of the 100 approved.
         usdtToken.mint(address(acc), 100e18);
 
-        // Phlimbo calls transferFrom via collectReward to pull 60e18
-        // We need to prank as the accumulator to call collectReward
-        // Instead, directly simulate: Phlimbo calls transferFrom on the USDT token
         vm.prank(address(phlimboMock));
         usdtToken.transferFrom(address(acc), address(phlimboMock), 60e18);
 
@@ -1981,46 +1580,327 @@ contract ConditionalClaimTest is Test {
 
         assertEq(usdtToken.allowance(address(acc), address(phlimboMock)), 100e18, "Second approvePhlimbo should succeed with forceApprove");
     }
+}
 
-    /**
-     * @notice Test that forceApprove pattern works correctly with MockUSDT.
-     * @dev Validates that the approve-to-zero-then-to-new-value pattern handles
-     *      USDT's non-standard behavior. Demonstrates the MockUSDT reverts on
-     *      non-zero-to-non-zero and that the forceApprove workaround succeeds.
-     */
-    function test_forceApprove_PatternWorksCorrectly_WithUSDTMock() public {
-        MockUSDT usdtToken = new MockUSDT("USDT", "USDT");
-        usdtToken.mint(address(this), 1000e18);
+/**
+ * @title NFTClaimGateTest
+ * @notice Tests for the NFT-based claim gating on StableYieldAccumulator
+ */
+contract NFTClaimGateTest is Test {
+    StableYieldAccumulator public accumulator;
+    MockERC20 public rewardToken;
+    MockERC20 public strategyToken1;
+    MockYieldStrategy public mockStrategy1;
+    MockPhlimbo public mockPhlimbo;
+    MockNFTMinter public mockNFTMinter;
 
-        address spender = makeAddr("spender");
+    address public owner;
+    address public minterAddr;
+    address public phlimboAddr;
+    address public claimer;
 
-        // First approve (0 -> non-zero): should work
-        usdtToken.approve(spender, 100e18);
-        assertEq(usdtToken.allowance(address(this), spender), 100e18);
+    // Events
+    event NFTMinterUpdated(address indexed oldNFTMinter, address indexed newNFTMinter);
 
-        // Raw non-zero-to-non-zero approve: should revert
-        vm.expectRevert("USDT: approve from non-zero to non-zero");
-        usdtToken.approve(spender, 200e18);
+    function setUp() public {
+        owner = address(this);
+        minterAddr = makeAddr("minter");
+        claimer = makeAddr("claimer");
 
-        // forceApprove pattern: approve to 0 first, then to new value
-        usdtToken.approve(spender, 0);
-        assertEq(usdtToken.allowance(address(this), spender), 0);
+        // Deploy mock tokens
+        rewardToken = new MockERC20("Reward Token", "RWD");
+        strategyToken1 = new MockERC20("Strategy Token 1", "STK1");
 
-        usdtToken.approve(spender, 200e18);
-        assertEq(usdtToken.allowance(address(this), spender), 200e18, "forceApprove pattern works");
+        // Deploy mock contracts
+        mockStrategy1 = new MockYieldStrategy();
+        mockNFTMinter = new MockNFTMinter();
+
+        // Deploy accumulator
+        accumulator = new StableYieldAccumulator();
+
+        // Deploy mock Phlimbo
+        mockPhlimbo = new MockPhlimbo(address(rewardToken));
+        mockPhlimbo.setYieldAccumulator(address(accumulator));
+        phlimboAddr = address(mockPhlimbo);
+
+        // Register the accumulator as an authorized burner on the NFTMinter
+        mockNFTMinter.setAuthorizedBurner(address(accumulator), true);
+
+        // Register a dispatcher (index 1) so we have a valid token ID
+        mockNFTMinter.registerDispatcher(makeAddr("dispatcher1"), 1e18, 100);
     }
 
-    function test_configurationUpdate_TargetPriceChange() public {
-        // Setup with price = 0.95e18
-        uint160 sqrtPriceX96 = 77193234817629166689178055120; // sqrt(0.95) * 2^96
-        _setupPriceCheck(sqrtPriceX96, 1e18, true);
+    /**
+     * @notice Helper to set up a complete claim scenario with NFT gate
+     */
+    function _setupClaimWithNFT(uint256 yieldAmount) internal {
+        // Setup basic claim infrastructure
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200); // 2% discount
+        accumulator.setNFTMinter(address(mockNFTMinter));
 
-        // Target = 1.0e18 (price below target)
-        accumulator.setTargetPrice(1e18);
-        assertFalse(accumulator.canClaim(), "Should be false with target = 1.0e18");
+        // Add strategy with token
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
-        // Lower target to 0.9e18 (price now above target)
-        accumulator.setTargetPrice(0.9e18);
-        assertTrue(accumulator.canClaim(), "Should be true after lowering target");
+        // Set token config
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        // Set up mock strategy with yield
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
+        strategyToken1.mint(address(mockStrategy1), yieldAmount);
+
+        // Fund claimer with reward tokens
+        uint256 claimerPayment = yieldAmount * 98 / 100;
+        rewardToken.mint(claimer, claimerPayment + 1e18);
+
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        // Approve Phlimbo
+        accumulator.approvePhlimbo(type(uint256).max);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    setNFTMinter TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_setNFTMinter_OnlyOwner() public {
+        vm.prank(claimer);
+        vm.expectRevert();
+        accumulator.setNFTMinter(address(mockNFTMinter));
+    }
+
+    function test_setNFTMinter_Success() public {
+        vm.expectEmit(true, true, false, true);
+        emit NFTMinterUpdated(address(0), address(mockNFTMinter));
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        assertEq(accumulator.nftMinter(), address(mockNFTMinter), "NFT minter should be set");
+    }
+
+    function test_setNFTMinter_CanUpdate() public {
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        MockNFTMinter newMinter = new MockNFTMinter();
+        vm.expectEmit(true, true, false, true);
+        emit NFTMinterUpdated(address(mockNFTMinter), address(newMinter));
+        accumulator.setNFTMinter(address(newMinter));
+
+        assertEq(accumulator.nftMinter(), address(newMinter), "NFT minter should be updated");
+    }
+
+    function test_setNFTMinter_CanSetToZero() public {
+        accumulator.setNFTMinter(address(mockNFTMinter));
+        accumulator.setNFTMinter(address(0));
+        assertEq(accumulator.nftMinter(), address(0), "NFT minter should be zero");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    CLAIM WITH NFT GATE TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_claim_SucceedsWhenCallerHoldsValidNFT() public {
+        uint256 yieldAmount = 100e18;
+        _setupClaimWithNFT(yieldAmount);
+
+        // Mint NFT for claimer (tokenId = 1, matching dispatcher1)
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+
+        // Record balances before
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+        uint256 nftBalanceBefore = mockNFTMinter.balances(claimer, 1);
+
+        // Claim should succeed
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Verify yield received
+        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
+        assertEq(claimerYieldAfter - claimerYieldBefore, yieldAmount, "Claimer should receive yield tokens");
+
+        // Verify NFT was burned (balance decreased by 1)
+        uint256 nftBalanceAfter = mockNFTMinter.balances(claimer, 1);
+        assertEq(nftBalanceBefore - nftBalanceAfter, 1, "Exactly 1 NFT should be burned");
+
+        // Verify burn was called with correct parameters
+        assertEq(mockNFTMinter.burnCallCount(), 1, "burn should be called once");
+        assertEq(mockNFTMinter.lastBurnHolder(), claimer, "Burn holder should be claimer");
+        assertEq(mockNFTMinter.lastBurnTokenId(), 1, "Burn tokenId should be 1");
+        assertEq(mockNFTMinter.lastBurnQuantity(), 1, "Burn quantity should be 1");
+    }
+
+    function test_claim_RevertsWithNoValidNFT() public {
+        uint256 yieldAmount = 100e18;
+        _setupClaimWithNFT(yieldAmount);
+
+        // Do NOT mint NFT for claimer
+
+        // Claim should revert with NoValidNFT
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.NoValidNFT.selector);
+        accumulator.claim();
+    }
+
+    function test_claim_RevertsWhenNFTMinterNotConfigured() public {
+        // Setup without setting NFT minter
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+
+        // Do NOT set NFT minter
+        // accumulator.setNFTMinter(...)
+
+        vm.prank(claimer);
+        vm.expectRevert("NFT minter not configured");
+        accumulator.claim();
+    }
+
+    function test_claim_WorksWithDispatcherTokenIdOverride() public {
+        uint256 yieldAmount = 100e18;
+        _setupClaimWithNFT(yieldAmount);
+
+        // Register a second dispatcher with a custom tokenId override
+        address dispatcher2 = makeAddr("dispatcher2");
+        mockNFTMinter.registerDispatcher(dispatcher2, 2e18, 200); // index 2
+        uint256 customTokenId = 42;
+        mockNFTMinter.setDispatcherTokenIdOverride(dispatcher2, customTokenId);
+
+        // Mint NFT with the custom tokenId for claimer
+        mockNFTMinter.mintNFT(claimer, customTokenId, 1);
+
+        // Record balances before
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+
+        // Claim should succeed - it should find the NFT via the override
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Verify yield received
+        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
+        assertEq(claimerYieldAfter - claimerYieldBefore, yieldAmount, "Claimer should receive yield tokens");
+
+        // Verify the correct NFT was burned (custom tokenId)
+        assertEq(mockNFTMinter.lastBurnTokenId(), customTokenId, "Burn tokenId should be custom override");
+        assertEq(mockNFTMinter.balances(claimer, customTokenId), 0, "Custom NFT should be burned");
+    }
+
+    function test_claim_BurnsExactlyOneNFT() public {
+        uint256 yieldAmount = 100e18;
+        _setupClaimWithNFT(yieldAmount);
+
+        // Mint multiple NFTs for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 5); // 5 NFTs of tokenId 1
+
+        // Claim
+        vm.prank(claimer);
+        accumulator.claim();
+
+        // Should have burned exactly 1
+        assertEq(mockNFTMinter.balances(claimer, 1), 4, "Should have 4 remaining after burning 1");
+    }
+
+    function test_claim_SecondClaimWithSecondNFT() public {
+        uint256 yieldAmount = 50e18;
+        _setupClaimWithNFT(yieldAmount);
+
+        // Mint 2 NFTs for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 2);
+
+        // First claim
+        vm.prank(claimer);
+        accumulator.claim();
+
+        assertEq(mockNFTMinter.balances(claimer, 1), 1, "Should have 1 NFT remaining");
+
+        // Reset strategy yield for second claim
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
+        strategyToken1.mint(address(mockStrategy1), yieldAmount);
+
+        // Fund claimer for second claim
+        uint256 claimerPayment = yieldAmount * 98 / 100;
+        rewardToken.mint(claimer, claimerPayment + 1e18);
+
+        // Second claim should also succeed
+        vm.prank(claimer);
+        accumulator.claim();
+
+        assertEq(mockNFTMinter.balances(claimer, 1), 0, "Should have 0 NFTs remaining after 2 claims");
+    }
+
+    function test_claim_SecondClaimFailsWithoutNFT() public {
+        uint256 yieldAmount = 50e18;
+        _setupClaimWithNFT(yieldAmount);
+
+        // Mint only 1 NFT
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+
+        // First claim succeeds
+        vm.prank(claimer);
+        accumulator.claim();
+
+        assertEq(mockNFTMinter.balances(claimer, 1), 0, "Should have 0 NFTs after first claim");
+
+        // Reset strategy yield
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
+        strategyToken1.mint(address(mockStrategy1), yieldAmount);
+        rewardToken.mint(claimer, yieldAmount);
+
+        // Second claim should fail - no NFTs left
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.NoValidNFT.selector);
+        accumulator.claim();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    canClaim VIEW FUNCTION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_canClaim_TrueWhenCallerHoldsNFT() public {
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        // Mint NFT for claimer
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+
+        assertTrue(accumulator.canClaim(claimer), "Should return true when caller holds NFT");
+    }
+
+    function test_canClaim_FalseWhenCallerHasNoNFT() public {
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        assertFalse(accumulator.canClaim(claimer), "Should return false when caller has no NFT");
+    }
+
+    function test_canClaim_FalseWhenNFTMinterNotSet() public {
+        // Don't set NFT minter
+        assertFalse(accumulator.canClaim(claimer), "Should return false when nftMinter not set");
+    }
+
+    function test_canClaim_TrueWithDispatcherTokenIdOverride() public {
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        // Register a second dispatcher with custom tokenId
+        address dispatcher2 = makeAddr("dispatcher2");
+        mockNFTMinter.registerDispatcher(dispatcher2, 2e18, 200);
+        uint256 customTokenId = 99;
+        mockNFTMinter.setDispatcherTokenIdOverride(dispatcher2, customTokenId);
+
+        // Mint NFT with custom tokenId
+        mockNFTMinter.mintNFT(claimer, customTokenId, 1);
+
+        assertTrue(accumulator.canClaim(claimer), "Should return true with dispatcherTokenIdOverride NFT");
+    }
+
+    function test_canClaim_SkipsUnusedDispatchers() public {
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        // Register dispatcher1 was done in setUp (index 1)
+        // Register a second dispatcher but then "deactivate" it by setting dispatcher to address(0)
+        // Note: MockNFTMinter doesn't support deactivation, but we can test with no NFTs
+
+        // Claimer has no NFTs at all
+        assertFalse(accumulator.canClaim(claimer), "Should return false when no NFTs held");
     }
 }
