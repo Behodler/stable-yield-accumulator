@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {PoolId} from "v4-core/types/PoolId.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
-
 /**
  * @title IStableYieldAccumulator
  * @notice Interface for the StableYieldAccumulator contract
@@ -141,12 +137,9 @@ interface IStableYieldAccumulator {
     error ZeroAmount();
 
     /**
-     * @notice Thrown when trying to claim but phUSD price is below the price minimum
-     * @param phUSD Address of the phUSD token
-     * @param poolManager Address of the Uniswap V4 PoolManager used for price queries
-     * @param pricePoolId The pool identifier used for the price check (as uint256)
+     * @notice Thrown when caller has no valid NFT for claiming
      */
-    error phUSDPriceBelowTarget(address phUSD, address poolManager, uint256 pricePoolId);
+    error NoValidNFT();
 
     /*//////////////////////////////////////////////////////////////
                         YIELD STRATEGY MANAGEMENT
@@ -266,7 +259,7 @@ interface IStableYieldAccumulator {
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full flow:
-     *      1. Enforce price minimum: phUSD spot price must meet target threshold
+     *      1. Verify caller holds a valid NFT and burn 1 unit
      *      2. Calculate total pending yield (normalized)
      *      3. Apply discount to get claimer payment
      *      4. TransferFrom claimer to phlimbo
@@ -304,92 +297,30 @@ interface IStableYieldAccumulator {
     function getTotalYield() external view returns (uint256);
 
     /*//////////////////////////////////////////////////////////////
-                    CONDITIONAL CLAIM CONFIGURATION
+                        NFT MINTER CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Sets the Uniswap V4 PoolManager for price queries
-     * @param _poolManager Address of the Uniswap V4 PoolManager contract
+     * @notice Sets the NFTMinter contract address for claim gating
+     * @param _nftMinter Address of the NFTMinter ERC1155 contract
      */
-    function setPoolManager(address _poolManager) external;
+    function setNFTMinter(address _nftMinter) external;
 
     /**
-     * @notice Sets the price pool configuration for conditional claims
-     * @param _poolId The PoolId of the phUSD/sUSDS pool
-     * @param _token0IsPhUSD True if phUSD is currency0 in the pool
+     * @notice Gets the current NFTMinter address
+     * @return Address of the NFTMinter contract
      */
-    function setPricePool(PoolId _poolId, bool _token0IsPhUSD) external;
-
-    /**
-     * @notice Sets the sUSDS vault token address
-     * @param _sUSDS Address of the sUSDS ERC4626 vault
-     */
-    function setSUSDS(address _sUSDS) external;
-
-    /**
-     * @notice Sets the target price threshold for conditional claims
-     * @param _targetPrice Target price in USDS terms (18 decimal precision)
-     */
-    function setTargetPrice(uint256 _targetPrice) external;
-
-    /**
-     * @notice Sets the phUSD token address
-     * @dev Used in the phUSDPriceBelowTarget error to assist bots
-     * @param _phUSD Address of the phUSD token
-     */
-    function setPhUSD(address _phUSD) external;
-
-    /**
-     * @notice Gets the current Uniswap V4 PoolManager address
-     * @return Address of the PoolManager contract
-     */
-    function poolManager() external view returns (IPoolManager);
-
-    /**
-     * @notice Gets the price pool identifier
-     * @return The PoolId for price queries
-     */
-    function pricePoolId() external view returns (PoolId);
-
-    /**
-     * @notice Gets the sUSDS vault token address
-     * @return Address of the sUSDS ERC4626 vault
-     */
-    function sUSDS() external view returns (IERC4626);
-
-    /**
-     * @notice Gets the target price threshold
-     * @return Target price in USDS terms (18 decimal precision)
-     */
-    function targetPrice() external view returns (uint256);
-
-    /**
-     * @notice Gets the token0IsPhUSD flag
-     * @return True if phUSD is currency0 in the price pool
-     */
-    function token0IsPhUSD() external view returns (bool);
-
-    /**
-     * @notice Gets the phUSD token address
-     * @return Address of the phUSD token
-     */
-    function phUSD() external view returns (address);
+    function nftMinter() external view returns (address);
 
     /*//////////////////////////////////////////////////////////////
                         BOT HELPER FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Checks if a claim can be executed based on the price condition
-     * @dev Returns true if price check is disabled or current price >= target
-     * @return True if claim() would not revert due to price check
+     * @notice Checks if a specific caller can claim based on NFT holdings
+     * @dev Returns true if the caller holds any valid NFT from the minter
+     * @param caller Address to check
+     * @return True if the caller holds a valid NFT
      */
-    function canClaim() external view returns (bool);
-
-    /**
-     * @notice Returns the current phUSD price in USDS terms
-     * @dev Returns 0 if poolManager is not configured
-     * @return Current phUSD price with 18 decimal precision
-     */
-    function claimPrice() external view returns (uint256);
+    function canClaim(address caller) external view returns (bool);
 }

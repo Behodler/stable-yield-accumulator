@@ -9,7 +9,8 @@ remappings = [
     "phlimbo-ea/=lib/mutable/phlimbo-ea/src/",
     "@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/",
     "v4-core/=lib/v4-periphery/lib/v4-core/src/",
-    "v4-periphery/=lib/v4-periphery/"
+    "v4-periphery/=lib/v4-periphery/",
+    "yield-claim-nft/=lib/mutable/yield-claim-nft/src/"
 ]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

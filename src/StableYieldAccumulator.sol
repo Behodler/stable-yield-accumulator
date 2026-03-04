@@ -6,15 +6,12 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "pauser/interfaces/IPausable.sol";
 import "./interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
 import "phlimbo-ea/interfaces/IPhlimbo.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
-import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
-import {FullMath} from "v4-core/libraries/FullMath.sol";
+import "yield-claim-nft/interfaces/INFTMinter.sol";
 
 /**
  * @title StableYieldAccumulator
@@ -55,10 +52,10 @@ import {FullMath} from "v4-core/libraries/FullMath.sol";
  * 2. **Exchange Rate Mappings** - Tracks decimal places (6 for USDC, 18 for Dola, etc.) and exchange rates
  * 3. **No Oracles/AMMs** - Uses assumed 1:1 exchange rates for stablecoins (owner can adjust for permanent depegs)
  * 4. **Claim Mechanism** - External users swap their reward token holdings for pending yield strategy rewards
+ * 5. **NFT Gate** - Claims require holding a valid NFT from the NFTMinter contract; exactly 1 NFT is burned per claim
  */
 contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable, IStableYieldAccumulator {
     using SafeERC20 for IERC20;
-    using StateLibrary for IPoolManager;
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -121,46 +118,14 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     mapping(address => address) public strategyTokens;
 
     /*//////////////////////////////////////////////////////////////
-                    CONDITIONAL CLAIM STATE VARIABLES
+                        NFT MINTER STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Uniswap V4 PoolManager for price queries
-     * @dev Used to get sqrtPriceX96 from the phUSD/sUSDS pool
+     * @notice ERC1155 NFTMinter contract address for claim gating
+     * @dev Claims require holding at least 1 NFT from this contract; exactly 1 is burned per claim
      */
-    IPoolManager public poolManager;
-
-    /**
-     * @notice Pool identifier for the phUSD/sUSDS price pool
-     * @dev Used to query the spot price from the Uniswap V4 pool
-     */
-    PoolId public pricePoolId;
-
-    /**
-     * @notice sUSDS vault token for converting sUSDS to USDS value
-     * @dev Used to call convertToAssets() to get the USDS equivalent
-     */
-    IERC4626 public sUSDS;
-
-    /**
-     * @notice Target price threshold for conditional claims
-     * @dev Price is expressed in USDS terms with 18 decimal precision
-     *      Claims are only allowed when phUSD price >= targetPrice
-     */
-    uint256 public targetPrice;
-
-    /**
-     * @notice Indicates token ordering in the Uniswap V4 pool
-     * @dev True if phUSD is currency0 (lower address), false if currency1
-     *      Required for correct price interpretation from sqrtPriceX96
-     */
-    bool public token0IsPhUSD;
-
-    /**
-     * @notice Address of the phUSD token
-     * @dev Included in the phUSDPriceBelowTarget error to assist MEV bots
-     */
-    address public phUSD;
+    address public nftMinter;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -181,39 +146,11 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     event MinterUpdated(address indexed oldMinter, address indexed newMinter);
 
     /**
-     * @notice Emitted when the pool manager address is updated
-     * @param oldPoolManager Previous pool manager address
-     * @param newPoolManager New pool manager address
+     * @notice Emitted when the NFT minter address is updated
+     * @param oldNFTMinter Previous NFT minter address
+     * @param newNFTMinter New NFT minter address
      */
-    event PoolManagerUpdated(address indexed oldPoolManager, address indexed newPoolManager);
-
-    /**
-     * @notice Emitted when the price pool configuration is updated
-     * @param poolId The new pool identifier
-     * @param token0IsPhUSD Whether phUSD is token0 in the pool
-     */
-    event PricePoolUpdated(PoolId indexed poolId, bool token0IsPhUSD);
-
-    /**
-     * @notice Emitted when the sUSDS address is updated
-     * @param oldSUSDS Previous sUSDS address
-     * @param newSUSDS New sUSDS address
-     */
-    event SUSDSUpdated(address indexed oldSUSDS, address indexed newSUSDS);
-
-    /**
-     * @notice Emitted when the target price is updated
-     * @param oldTargetPrice Previous target price
-     * @param newTargetPrice New target price
-     */
-    event TargetPriceUpdated(uint256 oldTargetPrice, uint256 newTargetPrice);
-
-    /**
-     * @notice Emitted when the phUSD address is updated
-     * @param oldPhUSD Previous phUSD address
-     * @param newPhUSD New phUSD address
-     */
-    event PhUSDUpdated(address indexed oldPhUSD, address indexed newPhUSD);
+    event NFTMinterUpdated(address indexed oldNFTMinter, address indexed newNFTMinter);
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -264,16 +201,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     /**
      * @notice Pauses all state-changing operations protected by whenNotPaused
      * @dev Only callable by the designated pauser address
-     *      Reverts if caller is not the pauser
-     *      Reverts if contract is already paused
-     *      Calls internal OpenZeppelin _pause() function
-     *      Emits Paused event from OpenZeppelin Pausable
-     *
-     * ## Usage
-     * Should be called in emergency situations where contract operations need to be halted:
-     * - Security vulnerability discovered
-     * - Unexpected behavior in yield strategies
-     * - Need to prevent further state changes during investigation
      */
     function pause() external override onlyPauser {
         _pause();
@@ -282,17 +209,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     /**
      * @notice Unpauses the contract, resuming normal operations
      * @dev Callable by EITHER the owner OR the pauser (Behodler3 pattern)
-     *      This dual-authority approach provides redundancy:
-     *      - If pauser is compromised/unavailable, owner can restore operations
-     *      - If owner is unavailable, pauser can restore operations
-     *      Reverts if contract is not paused
-     *      Calls internal OpenZeppelin _unpause() function
-     *      Emits Unpaused event from OpenZeppelin Pausable
-     *
-     * ## Rationale for Dual Authority
-     * Following the Behodler3 pattern, both owner and pauser can unpause to ensure the contract
-     * can always be restored to operational state, even if one of the authorized addresses is
-     * compromised or unavailable.
      */
     function unpause() external override {
         require(msg.sender == owner() || msg.sender == pauser, "Only owner or pauser can unpause");
@@ -377,7 +293,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Pauses a token, preventing claims with it
-     * @dev Sets the paused flag in tokenConfigs mapping
      * @param token Address of the token to pause
      */
     function pauseToken(address token) external override onlyOwner {
@@ -387,7 +302,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Unpauses a token, allowing claims with it
-     * @dev Clears the paused flag in tokenConfigs mapping
      * @param token Address of the token to unpause
      */
     function unpauseToken(address token) external override onlyOwner {
@@ -397,7 +311,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Gets the configuration for a token
-     * @dev Returns stored TokenConfig from mapping
      * @param token Address of the token
      * @return TokenConfig struct with decimals, normalizedExchangeRate, and paused status
      */
@@ -411,7 +324,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Sets the discount rate for claims
-     * @dev Validates rate does not exceed 10000 basis points (100%)
      * @param rate Discount rate in basis points (e.g., 200 = 2%)
      */
     function setDiscountRate(uint256 rate) external override onlyOwner {
@@ -436,7 +348,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Sets the phlimbo address where claimed reward tokens are transferred
-     * @dev Validates non-zero address
      * @param _phlimbo Address of the Phlimbo contract
      */
     function setPhlimbo(address _phlimbo) external onlyOwner {
@@ -449,7 +360,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Sets the minter address that holds deposits in yield strategies
-     * @dev Used for querying yield from strategies
      * @param _minter Address of the minter contract
      */
     function setMinter(address _minter) external onlyOwner {
@@ -462,7 +372,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Sets the reward token address
-     * @dev This is the single stablecoin used for consolidated reward distribution
      * @param _rewardToken Address of the reward token (e.g., USDC)
      */
     function setRewardToken(address _rewardToken) external onlyOwner {
@@ -472,7 +381,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Approves Phlimbo to spend reward tokens from this contract
-     * @dev Only callable by owner. Required for Phlimbo to pull tokens via collectReward
      * @param amount Amount of reward tokens to approve
      */
     function approvePhlimbo(uint256 amount) external onlyOwner {
@@ -483,65 +391,19 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /*//////////////////////////////////////////////////////////////
-                    CONDITIONAL CLAIM CONFIGURATION
+                        NFT MINTER CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Sets the Uniswap V4 PoolManager for price queries
-     * @dev Used to query sqrtPriceX96 from the phUSD/sUSDS pool
-     * @param _poolManager Address of the Uniswap V4 PoolManager contract
+     * @notice Sets the NFTMinter contract address for claim gating
+     * @dev The NFTMinter must be an ERC1155 contract that also implements INFTMinter.
+     *      The StableYieldAccumulator must be registered as an authorized burner on the NFTMinter.
+     * @param _nftMinter Address of the NFTMinter contract
      */
-    function setPoolManager(address _poolManager) external onlyOwner {
-        address oldPoolManager = address(poolManager);
-        poolManager = IPoolManager(_poolManager);
-        emit PoolManagerUpdated(oldPoolManager, _poolManager);
-    }
-
-    /**
-     * @notice Sets the price pool configuration for conditional claims
-     * @dev Configures which Uniswap V4 pool to use for price queries
-     * @param _poolId The PoolId of the phUSD/sUSDS pool
-     * @param _token0IsPhUSD True if phUSD is currency0 in the pool
-     */
-    function setPricePool(PoolId _poolId, bool _token0IsPhUSD) external onlyOwner {
-        pricePoolId = _poolId;
-        token0IsPhUSD = _token0IsPhUSD;
-        emit PricePoolUpdated(_poolId, _token0IsPhUSD);
-    }
-
-    /**
-     * @notice Sets the sUSDS vault token address
-     * @dev Used for converting sUSDS amounts to USDS value
-     * @param _sUSDS Address of the sUSDS ERC4626 vault
-     */
-    function setSUSDS(address _sUSDS) external onlyOwner {
-        address oldSUSDS = address(sUSDS);
-        sUSDS = IERC4626(_sUSDS);
-        emit SUSDSUpdated(oldSUSDS, _sUSDS);
-    }
-
-    /**
-     * @notice Sets the target price threshold for conditional claims
-     * @dev Claims are only allowed when phUSD price in USDS >= targetPrice
-     *      Set to 0 to disable the price check
-     * @param _targetPrice Target price in USDS terms (18 decimal precision)
-     */
-    function setTargetPrice(uint256 _targetPrice) external onlyOwner {
-        uint256 oldTargetPrice = targetPrice;
-        targetPrice = _targetPrice;
-        emit TargetPriceUpdated(oldTargetPrice, _targetPrice);
-    }
-
-    /**
-     * @notice Sets the phUSD token address
-     * @dev Used in the phUSDPriceBelowTarget error to assist MEV bots in identifying
-     *      the token, pool manager, and pool when a claim fails the price minimum check
-     * @param _phUSD Address of the phUSD token
-     */
-    function setPhUSD(address _phUSD) external onlyOwner {
-        address oldPhUSD = phUSD;
-        phUSD = _phUSD;
-        emit PhUSDUpdated(oldPhUSD, _phUSD);
+    function setNFTMinter(address _nftMinter) external onlyOwner {
+        address oldNFTMinter = nftMinter;
+        nftMinter = _nftMinter;
+        emit NFTMinterUpdated(oldNFTMinter, _nftMinter);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -551,31 +413,19 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full claim flow:
-     *      1. Enforce price minimum: phUSD spot price must meet target threshold
+     *      1. Verify caller holds a valid NFT and burn 1 unit
      *      2. Calculate total pending yield across all strategies (normalized to 18 decimals)
      *      3. Apply discount to get claimer payment amount
      *      4. Transfer rewardToken FROM claimer TO phlimbo
      *      5. Withdraw yield FROM each strategy TO claimer
-     *
-     * Example with 2% discount:
-     * - Strategy A has 10 USDT pending, Strategy B has 5 USDS pending
-     * - Total = 15 USD equivalent (normalized)
-     * - Claimer pays: 15 * 0.98 = 14.7 USDC to phlimbo
-     * - Claimer receives: 10 USDT + 5 USDS from strategies
      */
     function claim() external override whenNotPaused nonReentrant {
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
         if (minterAddress == address(0)) revert ZeroAddress();
 
-        // Price minimum check: only allow claim if phUSD spot price >= target price
-        // Skip check if poolManager is not set or targetPrice is 0 (graceful degradation)
-        if (address(poolManager) != address(0) && targetPrice > 0) {
-            uint256 currentPrice = _getPhUSDPriceInUSDS();
-            if (currentPrice < targetPrice) {
-                revert phUSDPriceBelowTarget(phUSD, address(poolManager), uint256(PoolId.unwrap(pricePoolId)));
-            }
-        }
+        // NFT gate: verify caller holds a valid NFT and burn 1 unit
+        _validateAndBurnNFT(msg.sender);
 
         uint256 totalNormalizedYield = 0;
         uint256 strategiesWithYield = 0;
@@ -603,7 +453,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         if (totalNormalizedYield == 0) revert ZeroAmount();
 
         // Calculate and collect claimer payment (apply discount)
-        // discountRate is in basis points (e.g., 200 = 2%)
         uint256 claimerPayment = totalNormalizedYield * (10000 - discountRate) / 10000;
         uint256 actualPayment = _denormalizeAmount(claimerPayment, rewardToken);
 
@@ -612,6 +461,35 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         IPhlimbo(phlimbo).collectReward(actualPayment);
 
         emit RewardsClaimed(msg.sender, actualPayment, strategiesWithYield);
+    }
+
+    /**
+     * @notice Internal helper to validate NFT ownership and burn 1 unit
+     * @dev Iterates through all dispatcher configs to find a valid NFT held by the caller
+     * @param caller The address to check for NFT ownership
+     */
+    function _validateAndBurnNFT(address caller) internal {
+        require(nftMinter != address(0), "NFT minter not configured");
+
+        INFTMinter minter = INFTMinter(nftMinter);
+        uint256 count = minter.nextIndex();
+        for (uint256 i = 1; i < count; i++) {
+            (address dispatcher, , ) = minter.configs(i);
+            if (dispatcher == address(0)) continue;
+
+            // Get the effective token ID
+            uint256 tokenId = minter.dispatcherTokenIdOverride(dispatcher);
+            if (tokenId == 0) {
+                tokenId = i; // default: index IS the token ID
+            }
+
+            // Check if caller holds this NFT
+            if (IERC1155(nftMinter).balanceOf(caller, tokenId) > 0) {
+                minter.burn(caller, tokenId, 1);
+                return; // found and burned, proceed with claim
+            }
+        }
+        revert NoValidNFT();
     }
 
     /**
@@ -633,7 +511,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Internal helper to get normalized yield for a specific strategy
-     * @dev Calls _getYieldForStrategy and normalizes the result to 18 decimals
      * @param strategy Address of the yield strategy
      * @param token Address of the strategy's underlying token
      * @return Yield amount normalized to 18 decimals
@@ -670,7 +547,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         }
 
         // Apply exchange rate (already normalized to 18 decimals)
-        // exchangeRate of 1e18 means 1:1
         if (exchangeRate > 0 && exchangeRate != 1e18) {
             scaled = scaled * exchangeRate / 1e18;
         }
@@ -710,80 +586,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /**
-     * @notice Calculates the phUSD price in USDS terms from the Uniswap V4 pool
-     * @dev Price calculation:
-     *      1. Get sqrtPriceX96 from PoolManager.getSlot0(pricePoolId)
-     *      2. Calculate raw price: (sqrtPriceX96 / 2^96)^2
-     *      3. Interpret based on token0IsPhUSD flag
-     *      4. Convert sUSDS to USDS using sUSDS.convertToAssets()
-     *
-     * Price interpretation:
-     * - sqrtPriceX96 represents sqrt(token1/token0) * 2^96
-     * - If token0IsPhUSD: price = token1/token0 = sUSDS/phUSD
-     *   - phUSD price in sUSDS = (sqrtPriceX96)^2 / 2^192
-     *   - phUSD price in USDS = (sUSDS amount * convertToAssets(1e18)) / 1e18
-     * - If token1IsPhUSD: price = 1 / (token1/token0) = phUSD/sUSDS
-     *   - sUSDS price in phUSD = (sqrtPriceX96)^2 / 2^192
-     *   - phUSD price in sUSDS = 2^192 / (sqrtPriceX96)^2
-     *
-     * @return price The phUSD price in USDS terms with 18 decimal precision
-     */
-    function _getPhUSDPriceInUSDS() internal view returns (uint256) {
-        // Get slot0 from the price pool
-        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(pricePoolId);
-
-        // Calculate price from sqrtPriceX96
-        // sqrtPriceX96 = sqrt(price) * 2^96
-        // price = (sqrtPriceX96 / 2^96)^2 = (sqrtPriceX96)^2 / 2^192
-        //
-        // Using FullMath to handle potential overflow:
-        // price = sqrtPriceX96 * sqrtPriceX96 / 2^192
-        //
-        // For 18 decimal precision, we need:
-        // price_18decimals = sqrtPriceX96 * sqrtPriceX96 * 1e18 / 2^192
-
-        uint256 priceInSUSDS;
-
-        if (token0IsPhUSD) {
-            // token0 = phUSD, token1 = sUSDS
-            // sqrtPriceX96 represents sqrt(sUSDS/phUSD) * 2^96
-            // price = sUSDS per phUSD = (sqrtPriceX96)^2 / 2^192
-            // price_18decimals = sqrtPriceX96^2 * 1e18 / 2^192
-
-            // We need phUSD price IN sUSDS terms (how many sUSDS per phUSD)
-            priceInSUSDS = FullMath.mulDiv(
-                uint256(sqrtPriceX96) * uint256(sqrtPriceX96),
-                1e18,
-                1 << 192
-            );
-        } else {
-            // token0 = sUSDS, token1 = phUSD
-            // sqrtPriceX96 represents sqrt(phUSD/sUSDS) * 2^96
-            // price = phUSD per sUSDS = (sqrtPriceX96)^2 / 2^192
-            // phUSD price in sUSDS = 1 / price = 2^192 / (sqrtPriceX96)^2
-            // price_18decimals = 1e18 * 2^192 / sqrtPriceX96^2
-
-            priceInSUSDS = FullMath.mulDiv(
-                1e18,
-                1 << 192,
-                uint256(sqrtPriceX96) * uint256(sqrtPriceX96)
-            );
-        }
-
-        // Convert sUSDS to USDS using the sUSDS vault's conversion rate
-        // priceInSUSDS is "how many sUSDS per 1 phUSD" with 18 decimals
-        // convertToAssets(priceInSUSDS) gives us "how many USDS that amount of sUSDS is worth"
-        if (address(sUSDS) != address(0)) {
-            return sUSDS.convertToAssets(priceInSUSDS);
-        }
-
-        // If sUSDS not configured, return price in sUSDS (assume 1:1)
-        return priceInSUSDS;
-    }
-
-    /**
      * @notice Calculates how much the claimer would pay for total pending yield
-     * @dev Returns the discounted amount in reward token that claimer would pay
      * @return paymentAmount Amount of reward token claimer would pay (in reward token decimals)
      */
     function calculateClaimAmount()
@@ -822,36 +625,32 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Checks if a claim can be executed based on the price condition
-     * @dev Returns true if:
-     *      - poolManager is not configured (price check disabled)
-     *      - targetPrice is 0 (price check disabled)
-     *      - current phUSD price >= targetPrice
-     * @return True if claim() would not revert due to price check
+     * @notice Checks if a specific caller can claim based on NFT holdings
+     * @dev Returns true if the caller holds any valid NFT from the minter
+     * @param caller Address to check
+     * @return True if the caller holds a valid NFT
      */
-    function canClaim() external view returns (bool) {
-        // If price check is disabled, always return true
-        if (address(poolManager) == address(0) || targetPrice == 0) {
-            return true;
+    function canClaim(address caller) external view returns (bool) {
+        if (nftMinter == address(0)) {
+            return false;
         }
 
-        // Check if current price meets the target
-        uint256 currentPrice = _getPhUSDPriceInUSDS();
-        return currentPrice >= targetPrice;
-    }
+        INFTMinter minter = INFTMinter(nftMinter);
+        uint256 count = minter.nextIndex();
+        for (uint256 i = 1; i < count; i++) {
+            (address dispatcher, , ) = minter.configs(i);
+            if (dispatcher == address(0)) continue;
 
-    /**
-     * @notice Returns the current phUSD price in USDS terms
-     * @dev Returns 0 if poolManager is not configured
-     * @return Current phUSD price with 18 decimal precision
-     */
-    function claimPrice() external view returns (uint256) {
-        // Return 0 if pool manager not configured
-        if (address(poolManager) == address(0)) {
-            return 0;
+            uint256 tokenId = minter.dispatcherTokenIdOverride(dispatcher);
+            if (tokenId == 0) {
+                tokenId = i;
+            }
+
+            if (IERC1155(nftMinter).balanceOf(caller, tokenId) > 0) {
+                return true;
+            }
         }
-
-        return _getPhUSDPriceInUSDS();
+        return false;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -860,10 +659,8 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Gets the pending yield for a specific strategy
-     * @dev Simplified implementation - returns 0 as yield strategies track their own balances
-     *      In production, this would query the strategy's interface for pending yield
      * @param strategy Address of the yield strategy
-     * @return Pending yield amount (currently 0 as strategies handle their own accounting)
+     * @return Pending yield amount (in native token decimals)
      */
     function getYield(address strategy) external view override returns (uint256) {
         if (!isRegisteredStrategy[strategy]) revert StrategyNotRegistered();
@@ -886,9 +683,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Gets the total pending yield across all strategies
-     * @dev Returns yield normalized to 18 decimals for cross-token comparison.
-     *      Uses _getNormalizedYieldForStrategy() to properly normalize yields from
-     *      tokens with different decimal places (e.g., 6-decimal USDC, 18-decimal DOLA).
      * @return Total pending yield normalized to 18 decimals
      */
     function getTotalYield() external view override returns (uint256) {
