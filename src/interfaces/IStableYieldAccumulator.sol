@@ -141,6 +141,12 @@ interface IStableYieldAccumulator {
      */
     error NoValidNFT();
 
+    /**
+     * @notice Thrown when actual yield payment is less than the caller's minimum acceptable amount
+     * @dev Used for slippage protection against MEV front-running during claim
+     */
+    error InsufficientYield();
+
     /*//////////////////////////////////////////////////////////////
                         YIELD STRATEGY MANAGEMENT
     //////////////////////////////////////////////////////////////*/
@@ -265,8 +271,11 @@ interface IStableYieldAccumulator {
      *      4. TransferFrom claimer to phlimbo
      *      5. WithdrawFrom each strategy to claimer
      * @param nftIndex The dispatcher config index in NFTMinter identifying which NFT to validate and burn
+     * @param minRewardTokenSupplied Minimum acceptable payment amount in reward token decimals.
+     *        Reverts with InsufficientYield if actual payment is less than this value.
+     *        Pass 0 to disable slippage protection.
      */
-    function claim(uint256 nftIndex) external;
+    function claim(uint256 nftIndex, uint256 minRewardTokenSupplied) external;
 
     /**
      * @notice Calculates how much the claimer would pay for total pending yield
