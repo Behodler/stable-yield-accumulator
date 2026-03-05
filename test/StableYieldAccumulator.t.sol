@@ -785,7 +785,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Record balances after
         uint256 claimerRewardAfter = rewardToken.balanceOf(claimer);
@@ -805,7 +805,7 @@ contract StableYieldAccumulatorTest is Test {
         address claimer = _setupClaimScenario(yieldAmount);
 
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Verify withdrawFrom was called with correct parameters
         assertEq(mockStrategy1.withdrawFromCallCount(), 1, "withdrawFrom should be called once");
@@ -853,7 +853,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Verify claimer received both yield tokens
         assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
@@ -879,7 +879,7 @@ contract StableYieldAccumulatorTest is Test {
         vm.expectEmit(true, false, false, true);
         emit RewardsClaimed(claimer, expectedPayment, 1);
 
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_RevertIf_Paused() public {
@@ -891,7 +891,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert();
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_RevertIf_NoYield() public {
@@ -913,7 +913,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_RevertIf_PhlimboNotSet() public {
@@ -921,7 +921,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setMinter(minterAddr);
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_RevertIf_RewardTokenNotSet() public {
@@ -929,7 +929,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setMinter(minterAddr);
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_RevertIf_MinterNotSet() public {
@@ -937,7 +937,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_RevertIf_AllTokensPaused() public {
@@ -948,7 +948,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_calculateClaimAmount_ReturnsDiscountedPayment() public {
@@ -1147,7 +1147,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
         uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
@@ -1187,7 +1187,7 @@ contract StableYieldAccumulatorTest is Test {
         // Claim should revert due to pause
         vm.prank(claimer);
         vm.expectRevert();
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Unpause
         vm.prank(pauser);
@@ -1198,7 +1198,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
         uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
@@ -1417,7 +1417,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim should succeed, collecting only from unpaused strategy2
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Claimer should NOT receive strategyToken1 (paused)
         assertEq(strategyToken1.balanceOf(claimer), 0, "Should not receive yield from paused token");
@@ -1480,7 +1480,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Execute claim
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // The actual payment deducted from claimer should match calculateClaimAmount
         uint256 actualPayment = claimerBalanceBefore - rewardToken.balanceOf(claimer);
@@ -1525,7 +1525,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim — no tokens paused, should collect from both strategies
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Claimer should receive yield from both strategies
         assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
@@ -1715,7 +1715,7 @@ contract NFTClaimGateTest is Test {
 
         // Claim should succeed
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Verify yield received
         uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
@@ -1741,7 +1741,7 @@ contract NFTClaimGateTest is Test {
         // Claim should revert with NoValidNFT
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.NoValidNFT.selector);
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_RevertsWhenNFTMinterNotConfigured() public {
@@ -1755,7 +1755,7 @@ contract NFTClaimGateTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert("NFT minter not configured");
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     function test_claim_WorksWithDispatcherTokenIdOverride() public {
@@ -1774,9 +1774,9 @@ contract NFTClaimGateTest is Test {
         // Record balances before
         uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
-        // Claim should succeed - it should find the NFT via the override
+        // Claim should succeed - it should find the NFT via the override at index 2
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(2);
 
         // Verify yield received
         uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
@@ -1796,7 +1796,7 @@ contract NFTClaimGateTest is Test {
 
         // Claim
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         // Should have burned exactly 1
         assertEq(mockNFTMinter.balances(claimer, 1), 4, "Should have 4 remaining after burning 1");
@@ -1811,7 +1811,7 @@ contract NFTClaimGateTest is Test {
 
         // First claim
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         assertEq(mockNFTMinter.balances(claimer, 1), 1, "Should have 1 NFT remaining");
 
@@ -1825,7 +1825,7 @@ contract NFTClaimGateTest is Test {
 
         // Second claim should also succeed
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         assertEq(mockNFTMinter.balances(claimer, 1), 0, "Should have 0 NFTs remaining after 2 claims");
     }
@@ -1839,7 +1839,7 @@ contract NFTClaimGateTest is Test {
 
         // First claim succeeds
         vm.prank(claimer);
-        accumulator.claim();
+        accumulator.claim(1);
 
         assertEq(mockNFTMinter.balances(claimer, 1), 0, "Should have 0 NFTs after first claim");
 
@@ -1851,7 +1851,7 @@ contract NFTClaimGateTest is Test {
         // Second claim should fail - no NFTs left
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.NoValidNFT.selector);
-        accumulator.claim();
+        accumulator.claim(1);
     }
 
     /*//////////////////////////////////////////////////////////////

@@ -259,13 +259,14 @@ interface IStableYieldAccumulator {
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full flow:
-     *      1. Verify caller holds a valid NFT and burn 1 unit
+     *      1. Verify caller holds a valid NFT at the given index and burn 1 unit
      *      2. Calculate total pending yield (normalized)
      *      3. Apply discount to get claimer payment
      *      4. TransferFrom claimer to phlimbo
      *      5. WithdrawFrom each strategy to claimer
+     * @param nftIndex The dispatcher config index in NFTMinter identifying which NFT to validate and burn
      */
-    function claim() external;
+    function claim(uint256 nftIndex) external;
 
     /**
      * @notice Calculates how much the claimer would pay for total pending yield
