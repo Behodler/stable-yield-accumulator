@@ -419,13 +419,13 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      *      4. Transfer rewardToken FROM claimer TO phlimbo
      *      5. Withdraw yield FROM each strategy TO claimer
      */
-    function claim() external override whenNotPaused nonReentrant {
+    function claim(uint256 nftIndex) external override whenNotPaused nonReentrant {
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
         if (minterAddress == address(0)) revert ZeroAddress();
 
         // NFT gate: verify caller holds a valid NFT and burn 1 unit
-        _validateAndBurnNFT(msg.sender);
+        _validateAndBurnNFT(msg.sender, nftIndex);
 
         uint256 totalNormalizedYield = 0;
         uint256 strategiesWithYield = 0;
@@ -465,31 +465,27 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Internal helper to validate NFT ownership and burn 1 unit
-     * @dev Iterates through all dispatcher configs to find a valid NFT held by the caller
+     * @dev Uses the provided index for O(1) lookup instead of iterating all dispatcher configs
      * @param caller The address to check for NFT ownership
+     * @param index The dispatcher config index in NFTMinter
      */
-    function _validateAndBurnNFT(address caller) internal {
+    function _validateAndBurnNFT(address caller, uint256 index) internal {
         require(nftMinter != address(0), "NFT minter not configured");
-
         INFTMinter minter = INFTMinter(nftMinter);
-        uint256 count = minter.nextIndex();
-        for (uint256 i = 1; i < count; i++) {
-            (address dispatcher, , ) = minter.configs(i);
-            if (dispatcher == address(0)) continue;
 
-            // Get the effective token ID
-            uint256 tokenId = minter.dispatcherTokenIdOverride(dispatcher);
-            if (tokenId == 0) {
-                tokenId = i; // default: index IS the token ID
-            }
+        (address dispatcher, , ) = minter.configs(index);
+        if (dispatcher == address(0)) revert NoValidNFT();
 
-            // Check if caller holds this NFT
-            if (IERC1155(nftMinter).balanceOf(caller, tokenId) > 0) {
-                minter.burn(caller, tokenId, 1);
-                return; // found and burned, proceed with claim
-            }
+        uint256 tokenId = minter.dispatcherTokenIdOverride(dispatcher);
+        if (tokenId == 0) {
+            tokenId = index;
         }
-        revert NoValidNFT();
+
+        if (IERC1155(nftMinter).balanceOf(caller, tokenId) > 0) {
+            minter.burn(caller, tokenId, 1);
+        } else {
+            revert NoValidNFT();
+        }
     }
 
     /**
