@@ -419,7 +419,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      *      4. Transfer rewardToken FROM claimer TO phlimbo
      *      5. Withdraw yield FROM each strategy TO claimer
      */
-    function claim(uint256 nftIndex) external override whenNotPaused nonReentrant {
+    function claim(uint256 nftIndex, uint256 minRewardTokenSupplied) external override whenNotPaused nonReentrant {
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
         if (minterAddress == address(0)) revert ZeroAddress();
@@ -455,6 +455,9 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         // Calculate and collect claimer payment (apply discount)
         uint256 claimerPayment = totalNormalizedYield * (10000 - discountRate) / 10000;
         uint256 actualPayment = _denormalizeAmount(claimerPayment, rewardToken);
+
+        // Slippage protection: revert if actual payment is below caller's minimum
+        if (actualPayment < minRewardTokenSupplied) revert InsufficientYield();
 
         // Transfer reward tokens FROM claimer TO this contract, then have Phlimbo collect them
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), actualPayment);
