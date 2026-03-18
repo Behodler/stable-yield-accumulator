@@ -185,11 +185,11 @@ contract MockNFTMinter {
         address dispatcher;
         uint256 price;
         uint256 growthBasisPoints;
+        bool disabled;
     }
 
     uint256 public nextIndex;
     mapping(uint256 => DispatcherConfig) public _configs;
-    mapping(address => uint256) public dispatcherTokenIdOverride;
     mapping(uint256 => address) public tokenIdToDispatcher;
     mapping(address => bool) public authorizedBurners;
 
@@ -206,21 +206,20 @@ contract MockNFTMinter {
         nextIndex = 1; // starts at 1, 0 is invalid
     }
 
-    function configs(uint256 index) external view returns (address dispatcher, uint256 price, uint256 growthBasisPoints) {
+    function configs(uint256 index) external view returns (address dispatcher, uint256 price, uint256 growthBasisPoints, bool disabled) {
         DispatcherConfig memory config = _configs[index];
-        return (config.dispatcher, config.price, config.growthBasisPoints);
+        return (config.dispatcher, config.price, config.growthBasisPoints, config.disabled);
     }
 
     function registerDispatcher(address dispatcher, uint256 price, uint256 growthBasisPoints) external {
         uint256 index = nextIndex;
-        _configs[index] = DispatcherConfig(dispatcher, price, growthBasisPoints);
+        _configs[index] = DispatcherConfig(dispatcher, price, growthBasisPoints, false);
         tokenIdToDispatcher[index] = dispatcher;
         nextIndex++;
     }
 
-    function setDispatcherTokenIdOverride(address dispatcher, uint256 tokenId) external {
-        dispatcherTokenIdOverride[dispatcher] = tokenId;
-        tokenIdToDispatcher[tokenId] = dispatcher;
+    function setDispatcherDisabled(uint256 index, bool disabled) external {
+        _configs[index].disabled = disabled;
     }
 
     function setAuthorizedBurner(address burner, bool authorized) external {
@@ -1819,35 +1818,6 @@ contract NFTClaimGateTest is Test {
         accumulator.claim(1, 0);
     }
 
-    function test_claim_WorksWithDispatcherTokenIdOverride() public {
-        uint256 yieldAmount = 100e18;
-        _setupClaimWithNFT(yieldAmount);
-
-        // Register a second dispatcher with a custom tokenId override
-        address dispatcher2 = makeAddr("dispatcher2");
-        mockNFTMinter.registerDispatcher(dispatcher2, 2e18, 200); // index 2
-        uint256 customTokenId = 42;
-        mockNFTMinter.setDispatcherTokenIdOverride(dispatcher2, customTokenId);
-
-        // Mint NFT with the custom tokenId for claimer
-        mockNFTMinter.mintNFT(claimer, customTokenId, 1);
-
-        // Record balances before
-        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
-
-        // Claim should succeed - it should find the NFT via the override at index 2
-        vm.prank(claimer);
-        accumulator.claim(2, 0);
-
-        // Verify yield received
-        uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
-        assertEq(claimerYieldAfter - claimerYieldBefore, yieldAmount, "Claimer should receive yield tokens");
-
-        // Verify the correct NFT was burned (custom tokenId)
-        assertEq(mockNFTMinter.lastBurnTokenId(), customTokenId, "Burn tokenId should be custom override");
-        assertEq(mockNFTMinter.balances(claimer, customTokenId), 0, "Custom NFT should be burned");
-    }
-
     function test_claim_BurnsExactlyOneNFT() public {
         uint256 yieldAmount = 100e18;
         _setupClaimWithNFT(yieldAmount);
@@ -1937,21 +1907,6 @@ contract NFTClaimGateTest is Test {
     function test_canClaim_FalseWhenNFTMinterNotSet() public {
         // Don't set NFT minter
         assertFalse(accumulator.canClaim(claimer), "Should return false when nftMinter not set");
-    }
-
-    function test_canClaim_TrueWithDispatcherTokenIdOverride() public {
-        accumulator.setNFTMinter(address(mockNFTMinter));
-
-        // Register a second dispatcher with custom tokenId
-        address dispatcher2 = makeAddr("dispatcher2");
-        mockNFTMinter.registerDispatcher(dispatcher2, 2e18, 200);
-        uint256 customTokenId = 99;
-        mockNFTMinter.setDispatcherTokenIdOverride(dispatcher2, customTokenId);
-
-        // Mint NFT with custom tokenId
-        mockNFTMinter.mintNFT(claimer, customTokenId, 1);
-
-        assertTrue(accumulator.canClaim(claimer), "Should return true with dispatcherTokenIdOverride NFT");
     }
 
     function test_canClaim_SkipsUnusedDispatchers() public {

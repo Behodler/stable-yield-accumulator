@@ -474,18 +474,10 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      */
     function _validateAndBurnNFT(address caller, uint256 index) internal {
         require(nftMinter != address(0), "NFT minter not configured");
-        INFTMinter minter = INFTMinter(nftMinter);
+        require(index > 0, "Invalid index");
 
-        (address dispatcher, , ) = minter.configs(index);
-        if (dispatcher == address(0)) revert NoValidNFT();
-
-        uint256 tokenId = minter.dispatcherTokenIdOverride(dispatcher);
-        if (tokenId == 0) {
-            tokenId = index;
-        }
-
-        if (IERC1155(nftMinter).balanceOf(caller, tokenId) > 0) {
-            minter.burn(caller, tokenId, 1);
+        if (IERC1155(nftMinter).balanceOf(caller, index) > 0) {
+            INFTMinter(nftMinter).burn(caller, index, 1);
         } else {
             revert NoValidNFT();
         }
@@ -634,18 +626,9 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             return false;
         }
 
-        INFTMinter minter = INFTMinter(nftMinter);
-        uint256 count = minter.nextIndex();
+        uint256 count = INFTMinter(nftMinter).nextIndex();
         for (uint256 i = 1; i < count; i++) {
-            (address dispatcher, , ) = minter.configs(i);
-            if (dispatcher == address(0)) continue;
-
-            uint256 tokenId = minter.dispatcherTokenIdOverride(dispatcher);
-            if (tokenId == 0) {
-                tokenId = i;
-            }
-
-            if (IERC1155(nftMinter).balanceOf(caller, tokenId) > 0) {
+            if (IERC1155(nftMinter).balanceOf(caller, i) > 0) {
                 return true;
             }
         }
