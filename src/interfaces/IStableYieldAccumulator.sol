@@ -74,16 +74,26 @@ interface IStableYieldAccumulator {
     event PhlimboUpdated(address indexed oldPhlimbo, address indexed newPhlimbo);
 
     /**
+     * @notice Emitted when the nudge address is updated
+     * @param oldNudge Previous nudge address (may be address(0))
+     * @param newNudge New nudge address (may be address(0) to clear)
+     */
+    event NudgeUpdated(address indexed oldNudge, address indexed newNudge);
+
+    /**
+     * @notice Emitted when the nudge split percentage is updated
+     * @param oldSplit Previous split percentage (0-100)
+     * @param newSplit New split percentage (0-100)
+     */
+    event NudgeSplitUpdated(uint256 oldSplit, uint256 newSplit);
+
+    /**
      * @notice Emitted when a user claims rewards
      * @param claimer Address that performed the claim
      * @param amountPaid Amount of reward token paid
      * @param strategiesClaimed Number of strategies claimed from
      */
-    event RewardsClaimed(
-        address indexed claimer,
-        uint256 amountPaid,
-        uint256 strategiesClaimed
-    );
+    event RewardsClaimed(address indexed claimer, uint256 amountPaid, uint256 strategiesClaimed);
 
     /**
      * @notice Emitted when yield is collected from a strategy
@@ -146,6 +156,16 @@ interface IStableYieldAccumulator {
      * @dev Used for slippage protection against MEV front-running during claim
      */
     error InsufficientYield();
+
+    /**
+     * @notice Thrown when nudgeSplit is set above the maximum allowed value of 100
+     */
+    error InvalidNudgeSplit();
+
+    /**
+     * @notice Thrown during claim when nudgeSplit > 0 but the nudge address has not been set
+     */
+    error NudgeNotConfigured();
 
     /*//////////////////////////////////////////////////////////////
                         YIELD STRATEGY MANAGEMENT
@@ -253,6 +273,39 @@ interface IStableYieldAccumulator {
     function minterAddress() external view returns (address);
 
     /*//////////////////////////////////////////////////////////////
+                            NUDGE MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Sets the auxiliary "nudge" recipient that receives a configurable share of every claim payment
+     * @dev May be set to address(0) to clear. While the address is unset, nudgeSplit must remain 0
+     *      or claim() will revert with NudgeNotConfigured.
+     * @param _nudge Address that receives the nudge share of claim payments
+     */
+    function setNudgeAddress(address _nudge) external;
+
+    /**
+     * @notice Sets the percentage of each claim payment routed to the nudge address
+     * @dev Must be in the inclusive range [0, 100]. Reverts with InvalidNudgeSplit otherwise.
+     *      A value of 0 (the default) preserves pre-existing behavior (full payment to phlimbo).
+     *      A value of 100 routes the full payment to the nudge address and skips the phlimbo collectReward call.
+     * @param _split Percentage in the inclusive range [0, 100]
+     */
+    function setNudgeSplit(uint256 _split) external;
+
+    /**
+     * @notice Gets the current nudge recipient address
+     * @return Address of the nudge recipient (address(0) if unset)
+     */
+    function nudge() external view returns (address);
+
+    /**
+     * @notice Gets the current nudge split percentage
+     * @return Split percentage in the inclusive range [0, 100]
+     */
+    function nudgeSplit() external view returns (uint256);
+
+    /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
     //////////////////////////////////////////////////////////////*/
 
@@ -282,10 +335,7 @@ interface IStableYieldAccumulator {
      * @dev Returns the discounted amount in reward token decimals
      * @return Amount of reward token claimer would pay
      */
-    function calculateClaimAmount()
-        external
-        view
-        returns (uint256);
+    function calculateClaimAmount() external view returns (uint256);
 
     /*//////////////////////////////////////////////////////////////
                         YIELD CALCULATION
