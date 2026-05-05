@@ -100,6 +100,18 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     address public phlimbo;
 
     /**
+     * @notice Auxiliary recipient that receives a configurable share of each claim payment
+     * @dev Defaults to address(0); when nudgeSplit > 0, must be set or claim() reverts
+     */
+    address public nudge;
+
+    /**
+     * @notice Percentage of each claim payment routed to the nudge address
+     * @dev Inclusive range [0, 100]. Defaults to 0 (no diversion to nudge).
+     */
+    uint256 public nudgeSplit;
+
+    /**
      * @notice Address of the minter contract that holds deposits in yield strategies
      * @dev Used to query yield strategies for the minter's accumulated yield
      */
@@ -278,11 +290,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @param decimals Number of decimal places (must be <= 18)
      * @param normalizedExchangeRate Exchange rate normalized to 18 decimals
      */
-    function setTokenConfig(address token, uint8 decimals, uint256 normalizedExchangeRate)
-        external
-        override
-        onlyOwner
-    {
+    function setTokenConfig(address token, uint8 decimals, uint256 normalizedExchangeRate) external override onlyOwner {
         if (token == address(0)) revert ZeroAddress();
         if (decimals > 18) revert InvalidDecimals();
 
@@ -391,6 +399,34 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /*//////////////////////////////////////////////////////////////
+                            NUDGE MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Sets the auxiliary nudge recipient address
+     * @dev Accepts address(0) to clear. While unset, nudgeSplit must remain 0 or claim() reverts.
+     * @param _nudge Address that receives the nudge share of claim payments (or address(0) to clear)
+     */
+    function setNudgeAddress(address _nudge) external onlyOwner {
+        address oldNudge = nudge;
+        nudge = _nudge;
+        emit NudgeUpdated(oldNudge, _nudge);
+    }
+
+    /**
+     * @notice Sets the percentage of each claim payment routed to the nudge address
+     * @dev Must be in the inclusive range [0, 100]. A value of 0 disables routing to nudge.
+     * @param _split Percentage in the inclusive range [0, 100]
+     */
+    function setNudgeSplit(uint256 _split) external onlyOwner {
+        if (_split > 100) revert InvalidNudgeSplit();
+
+        uint256 oldSplit = nudgeSplit;
+        nudgeSplit = _split;
+        emit NudgeSplitUpdated(oldSplit, _split);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         NFT MINTER CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
@@ -459,9 +495,24 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         // Slippage protection: revert if actual payment is below caller's minimum
         if (actualPayment < minRewardTokenSupplied) revert InsufficientYield();
 
-        // Transfer reward tokens FROM claimer TO this contract, then have Phlimbo collect them
+        // If a split is configured but no nudge recipient is set, revert rather than silently
+        // routing the would-be nudge funds to phlimbo. Owner can either set the address or
+        // set nudgeSplit to 0 to restore default behavior.
+        if (nudgeSplit > 0 && nudge == address(0)) revert NudgeNotConfigured();
+
+        // Transfer reward tokens FROM claimer TO this contract, then split between nudge and Phlimbo
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), actualPayment);
-        IPhlimbo(phlimbo).collectReward(actualPayment);
+
+        // Compute nudge share first, then derive phlimbo amount via subtraction to avoid precision loss
+        uint256 nudgeAmount = (actualPayment * nudgeSplit) / 100;
+        uint256 phlimboAmount = actualPayment - nudgeAmount;
+
+        if (nudgeAmount > 0) {
+            IERC20(rewardToken).safeTransfer(nudge, nudgeAmount);
+        }
+        if (phlimboAmount > 0) {
+            IPhlimbo(phlimbo).collectReward(phlimboAmount);
+        }
 
         emit RewardsClaimed(msg.sender, actualPayment, strategiesWithYield);
     }
@@ -580,12 +631,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @notice Calculates how much the claimer would pay for total pending yield
      * @return paymentAmount Amount of reward token claimer would pay (in reward token decimals)
      */
-    function calculateClaimAmount()
-        external
-        view
-        override
-        returns (uint256)
-    {
+    function calculateClaimAmount() external view override returns (uint256) {
         if (minterAddress == address(0)) return 0;
 
         uint256 totalNormalizedYield = 0;
