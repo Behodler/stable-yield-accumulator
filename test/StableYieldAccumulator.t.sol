@@ -783,7 +783,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Record balances after
         uint256 claimerRewardAfter = rewardToken.balanceOf(claimer);
@@ -805,7 +805,7 @@ contract StableYieldAccumulatorTest is Test {
         address claimer = _setupClaimScenario(yieldAmount);
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Verify withdrawFrom was called with correct parameters
         assertEq(mockStrategy1.withdrawFromCallCount(), 1, "withdrawFrom should be called once");
@@ -853,7 +853,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Verify claimer received both yield tokens
         assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
@@ -879,7 +879,7 @@ contract StableYieldAccumulatorTest is Test {
         vm.expectEmit(true, false, false, true);
         emit RewardsClaimed(claimer, expectedPayment, 1);
 
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_RevertIf_Paused() public {
@@ -891,7 +891,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert();
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_RevertIf_NoYield() public {
@@ -913,7 +913,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_RevertIf_PhlimboNotSet() public {
@@ -921,7 +921,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setMinter(minterAddr);
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_RevertIf_RewardTokenNotSet() public {
@@ -929,7 +929,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setMinter(minterAddr);
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_RevertIf_MinterNotSet() public {
@@ -937,7 +937,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_RevertIf_AllTokensPaused() public {
@@ -948,7 +948,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_calculateClaimAmount_ReturnsDiscountedPayment() public {
@@ -956,7 +956,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // calculateClaimAmount should return what claimer would pay
         // Total yield: 100e18, discount: 2%, payment: 98e18
-        uint256 expectedPayment = accumulator.calculateClaimAmount();
+        uint256 expectedPayment = accumulator.calculateClaimAmount(new address[](0));
         assertEq(expectedPayment, 98e18, "Should return discounted payment amount");
     }
 
@@ -975,19 +975,19 @@ contract StableYieldAccumulatorTest is Test {
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 100e18);
 
         // No discount: payment = total yield
-        uint256 expectedPayment = accumulator.calculateClaimAmount();
+        uint256 expectedPayment = accumulator.calculateClaimAmount(new address[](0));
         assertEq(expectedPayment, 100e18, "Should return full amount with no discount");
     }
 
     function test_calculateClaimAmount_ZeroIfNoStrategies() public {
         accumulator.setMinter(minterAddr);
 
-        uint256 payment = accumulator.calculateClaimAmount();
+        uint256 payment = accumulator.calculateClaimAmount(new address[](0));
         assertEq(payment, 0, "Should return 0 if no strategies");
     }
 
     function test_calculateClaimAmount_ZeroIfMinterNotSet() public {
-        uint256 payment = accumulator.calculateClaimAmount();
+        uint256 payment = accumulator.calculateClaimAmount(new address[](0));
         assertEq(payment, 0, "Should return 0 if minter not set");
     }
 
@@ -1147,7 +1147,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
         uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
@@ -1187,7 +1187,7 @@ contract StableYieldAccumulatorTest is Test {
         // Claim should revert due to pause
         vm.prank(claimer);
         vm.expectRevert();
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Unpause
         vm.prank(pauser);
@@ -1198,7 +1198,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         uint256 phlimboBalanceAfter = rewardToken.balanceOf(phlimboAddr);
         uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
@@ -1413,7 +1413,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim should succeed, collecting only from unpaused strategy2
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Claimer should NOT receive strategyToken1 (paused)
         assertEq(strategyToken1.balanceOf(claimer), 0, "Should not receive yield from paused token");
@@ -1463,7 +1463,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.pauseToken(address(strategyToken1));
 
         // Query calculateClaimAmount BEFORE claim — should reflect only unpaused yield
-        uint256 calculatedAmount = accumulator.calculateClaimAmount();
+        uint256 calculatedAmount = accumulator.calculateClaimAmount(new address[](0));
 
         // Fund claimer with enough to cover the payment
         rewardToken.mint(claimer, calculatedAmount + 1e18);
@@ -1480,7 +1480,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Execute claim
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // The actual payment deducted from claimer should match calculateClaimAmount
         uint256 actualPayment = claimerBalanceBefore - rewardToken.balanceOf(claimer);
@@ -1527,7 +1527,7 @@ contract StableYieldAccumulatorTest is Test {
 
         // Claim — no tokens paused, should collect from both strategies
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Claimer should receive yield from both strategies
         assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
@@ -1603,7 +1603,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.InsufficientYield.selector);
-        accumulator.claim(1, tooHighMin);
+        accumulator.claim(1, tooHighMin, new address[](0));
     }
 
     function test_claim_SucceedsWhenMinEqualsActualPayment() public {
@@ -1614,7 +1614,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 expectedPayment = yieldAmount * 98 / 100;
 
         vm.prank(claimer);
-        accumulator.claim(1, expectedPayment);
+        accumulator.claim(1, expectedPayment, new address[](0));
 
         // Verify claim went through by checking claimer received yield tokens
         assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claimer should have received yield tokens");
@@ -1625,7 +1625,7 @@ contract StableYieldAccumulatorTest is Test {
         address claimer = _setupClaimScenario(yieldAmount);
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Verify claim went through by checking claimer received yield tokens
         assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claimer should have received yield tokens");
@@ -1642,7 +1642,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 lowMin = expectedPayment - 1e18;
 
         vm.prank(claimer);
-        accumulator.claim(1, lowMin);
+        accumulator.claim(1, lowMin, new address[](0));
 
         // Verify claim went through by checking claimer received yield tokens
         assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claimer should have received yield tokens");
@@ -1749,7 +1749,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive full payment");
         assertEq(mockPhlimbo.collectRewardCallCount(), 1, "Phlimbo should be called once");
@@ -1771,7 +1771,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         assertEq(
             rewardToken.balanceOf(nudgeAddr) - nudgeBalanceBefore, expectedNudge, "Nudge should receive 30% of payment"
@@ -1792,7 +1792,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         assertEq(
             rewardToken.balanceOf(nudgeAddr) - nudgeBalanceBefore, expectedPayment, "Nudge should receive full payment"
@@ -1809,7 +1809,7 @@ contract StableYieldAccumulatorTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.NudgeNotConfigured.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_NudgeSplitArithmeticPrecision() public {
@@ -1854,7 +1854,7 @@ contract StableYieldAccumulatorTest is Test {
         uint256 accumulatorBalBefore = rewardToken.balanceOf(address(accumulator));
 
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         uint256 nudgeReceived = rewardToken.balanceOf(nudgeAddr) - nudgeBalBefore;
         uint256 phlimboReceived = mockPhlimbo.lastCollectedAmount();
@@ -2004,7 +2004,7 @@ contract NFTClaimGateTest is Test {
 
         // Claim should succeed
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Verify yield received
         uint256 claimerYieldAfter = strategyToken1.balanceOf(claimer);
@@ -2030,7 +2030,7 @@ contract NFTClaimGateTest is Test {
         // Claim should revert with NoValidNFT
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.NoValidNFT.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_RevertsWhenNFTMinterNotConfigured() public {
@@ -2044,7 +2044,7 @@ contract NFTClaimGateTest is Test {
 
         vm.prank(claimer);
         vm.expectRevert("NFT minter not configured");
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     function test_claim_BurnsExactlyOneNFT() public {
@@ -2056,7 +2056,7 @@ contract NFTClaimGateTest is Test {
 
         // Claim
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         // Should have burned exactly 1
         assertEq(mockNFTMinter.balances(claimer, 1), 4, "Should have 4 remaining after burning 1");
@@ -2071,7 +2071,7 @@ contract NFTClaimGateTest is Test {
 
         // First claim
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         assertEq(mockNFTMinter.balances(claimer, 1), 1, "Should have 1 NFT remaining");
 
@@ -2085,7 +2085,7 @@ contract NFTClaimGateTest is Test {
 
         // Second claim should also succeed
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         assertEq(mockNFTMinter.balances(claimer, 1), 0, "Should have 0 NFTs remaining after 2 claims");
     }
@@ -2099,7 +2099,7 @@ contract NFTClaimGateTest is Test {
 
         // First claim succeeds
         vm.prank(claimer);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
 
         assertEq(mockNFTMinter.balances(claimer, 1), 0, "Should have 0 NFTs after first claim");
 
@@ -2111,7 +2111,7 @@ contract NFTClaimGateTest is Test {
         // Second claim should fail - no NFTs left
         vm.prank(claimer);
         vm.expectRevert(IStableYieldAccumulator.NoValidNFT.selector);
-        accumulator.claim(1, 0);
+        accumulator.claim(1, 0, new address[](0));
     }
 
     /*//////////////////////////////////////////////////////////////

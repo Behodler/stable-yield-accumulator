@@ -449,16 +449,35 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full claim flow:
-     *      1. Verify caller holds a valid NFT and burn 1 unit
-     *      2. Calculate total pending yield across all strategies (normalized to 18 decimals)
-     *      3. Apply discount to get claimer payment amount
-     *      4. Transfer rewardToken FROM claimer TO phlimbo
-     *      5. Withdraw yield FROM each strategy TO claimer
+     *      1. Validate every entry in exemptStrategies is registered (BEFORE burning the NFT,
+     *         so a bad input does not consume the caller's NFT)
+     *      2. Verify caller holds a valid NFT and burn 1 unit
+     *      3. Calculate total pending yield across all non-exempt strategies (normalized to 18 decimals)
+     *      4. Apply discount to get claimer payment amount
+     *      5. Transfer rewardToken FROM claimer TO phlimbo
+     *      6. Withdraw yield FROM each non-exempt strategy TO claimer
+     * @param nftIndex Dispatcher config index in NFTMinter for the NFT to validate and burn
+     * @param minRewardTokenSupplied Slippage protection; reverts with InsufficientYield if actual
+     *        payment is less than this value. Pass 0 to disable.
+     * @param exemptStrategies Registered strategies to skip in the iteration loop. Empty array
+     *        preserves original behavior. Each entry must be currently registered or the call
+     *        reverts with ExemptStrategyNotRegistered. Used to route around a misbehaving
+     *        strategy until owner remediation.
      */
-    function claim(uint256 nftIndex, uint256 minRewardTokenSupplied) external override whenNotPaused nonReentrant {
+    function claim(uint256 nftIndex, uint256 minRewardTokenSupplied, address[] calldata exemptStrategies)
+        external
+        override
+        whenNotPaused
+        nonReentrant
+    {
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
         if (minterAddress == address(0)) revert ZeroAddress();
+
+        // Validate exempt entries before burning NFT so a bad input does not consume the NFT
+        for (uint256 i = 0; i < exemptStrategies.length; i++) {
+            if (!isRegisteredStrategy[exemptStrategies[i]]) revert ExemptStrategyNotRegistered();
+        }
 
         // NFT gate: verify caller holds a valid NFT and burn 1 unit
         _validateAndBurnNFT(msg.sender, nftIndex);
@@ -473,6 +492,16 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             if (token == address(0)) continue;
 
             if (tokenConfigs[token].paused) continue;
+
+            // Skip if this strategy was explicitly exempted by the claimer
+            bool exempt = false;
+            for (uint256 j = 0; j < exemptStrategies.length; j++) {
+                if (exemptStrategies[j] == strategy) {
+                    exempt = true;
+                    break;
+                }
+            }
+            if (exempt) continue;
 
             uint256 yield = _getYieldForStrategy(strategy, token);
             if (yield > 0) {
@@ -629,10 +658,20 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Calculates how much the claimer would pay for total pending yield
+     * @dev Mirrors claim() — pass the same exemptStrategies you intend to pass to claim()
+     *      so the returned amount accurately reflects the payment that claim() will require.
+     * @param exemptStrategies Registered strategies to skip in the calculation. Empty array
+     *        preserves original behavior. Each entry must be currently registered or the call
+     *        reverts with ExemptStrategyNotRegistered.
      * @return paymentAmount Amount of reward token claimer would pay (in reward token decimals)
      */
-    function calculateClaimAmount() external view override returns (uint256) {
+    function calculateClaimAmount(address[] calldata exemptStrategies) external view override returns (uint256) {
         if (minterAddress == address(0)) return 0;
+
+        // Validate exempt entries are registered (mirrors claim() so the preview matches)
+        for (uint256 i = 0; i < exemptStrategies.length; i++) {
+            if (!isRegisteredStrategy[exemptStrategies[i]]) revert ExemptStrategyNotRegistered();
+        }
 
         uint256 totalNormalizedYield = 0;
 
@@ -641,6 +680,16 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             address token = strategyTokens[strategy];
             if (token == address(0)) continue;
             if (tokenConfigs[token].paused) continue;
+
+            // Skip if this strategy was explicitly exempted by the claimer
+            bool exempt = false;
+            for (uint256 j = 0; j < exemptStrategies.length; j++) {
+                if (exemptStrategies[j] == strategy) {
+                    exempt = true;
+                    break;
+                }
+            }
+            if (exempt) continue;
 
             uint256 yield = _getYieldForStrategy(strategy, token);
             if (yield > 0) {
