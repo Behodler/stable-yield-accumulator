@@ -146,12 +146,7 @@ contract MockYieldStrategy is IYieldStrategy {
      * @notice Mock withdrawFrom that transfers tokens to recipient
      * @dev Actually transfers ERC20 tokens from this contract to recipient
      */
-    function withdrawFrom(
-        address token,
-        address client,
-        uint256 amount,
-        address recipient
-    ) external override {
+    function withdrawFrom(address token, address client, uint256 amount, address recipient) external override {
         withdrawFromCallCount++;
         lastWithdrawToken = token;
         lastWithdrawClient = client;
@@ -206,7 +201,11 @@ contract MockNFTMinter {
         nextIndex = 1; // starts at 1, 0 is invalid
     }
 
-    function configs(uint256 index) external view returns (address dispatcher, uint256 price, uint256 growthBasisPoints, bool disabled) {
+    function configs(uint256 index)
+        external
+        view
+        returns (address dispatcher, uint256 price, uint256 growthBasisPoints, bool disabled)
+    {
         DispatcherConfig memory config = _configs[index];
         return (config.dispatcher, config.price, config.growthBasisPoints, config.disabled);
     }
@@ -296,12 +295,10 @@ contract StableYieldAccumulatorTest is Test {
     event TokenUnpaused(address indexed token);
     event DiscountRateSet(uint256 oldRate, uint256 newRate);
     event PhlimboUpdated(address indexed oldPhlimbo, address indexed newPhlimbo);
-    event RewardsClaimed(
-        address indexed claimer,
-        uint256 amountPaid,
-        uint256 strategiesClaimed
-    );
+    event RewardsClaimed(address indexed claimer, uint256 amountPaid, uint256 strategiesClaimed);
     event RewardsCollected(address indexed strategy, uint256 amount);
+    event NudgeUpdated(address indexed oldNudge, address indexed newNudge);
+    event NudgeSplitUpdated(uint256 oldSplit, uint256 newSplit);
 
     function setUp() public {
         owner = address(this);
@@ -516,7 +513,9 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(strategies.length, 1, "Should have 1 strategy");
         assertEq(strategies[0], address(mockStrategy1), "Strategy should be mockStrategy1");
         assertTrue(accumulator.isRegisteredStrategy(address(mockStrategy1)), "Strategy should be registered");
-        assertEq(accumulator.strategyTokens(address(mockStrategy1)), address(strategyToken1), "Strategy token should be set");
+        assertEq(
+            accumulator.strategyTokens(address(mockStrategy1)), address(strategyToken1), "Strategy token should be set"
+        );
     }
 
     function test_addYieldStrategy_EmitsEvent() public {
@@ -792,7 +791,9 @@ contract StableYieldAccumulatorTest is Test {
         uint256 phlimboRewardAfter = rewardToken.balanceOf(phlimboAddr);
 
         // Verify: Claimer paid reward tokens to phlimbo
-        assertEq(claimerRewardBefore - claimerRewardAfter, expectedPayment, "Claimer should have paid discounted amount");
+        assertEq(
+            claimerRewardBefore - claimerRewardAfter, expectedPayment, "Claimer should have paid discounted amount"
+        );
         assertEq(phlimboRewardAfter - phlimboRewardBefore, expectedPayment, "Phlimbo should have received payment");
 
         // Verify: Claimer received yield tokens from strategy
@@ -1040,7 +1041,7 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setMinter(minterAddr);
 
         // Set mock balances for both strategies
-        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 50e18);  // 50 yield
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 50e18); // 50 yield
         mockStrategy2.setBalances(address(strategyToken2), minterAddr, 2000e18, 100e18); // 100 yield
 
         uint256 totalYield = accumulator.getTotalYield();
@@ -1338,13 +1339,13 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.addYieldStrategy(address(dolaStrategy), address(dolaLike));
 
         // Configure token decimals and exchange rates (1:1)
-        accumulator.setTokenConfig(address(usdcLike), 6, 1e18);  // 6 decimals
+        accumulator.setTokenConfig(address(usdcLike), 6, 1e18); // 6 decimals
         accumulator.setTokenConfig(address(dolaLike), 18, 1e18); // 18 decimals
 
         // Set yields:
         // - USDC strategy: 300 USDC yield (in 6 decimals = 300e6)
         // - DOLA strategy: 4000 DOLA yield (in 18 decimals = 4000e18)
-        uint256 usdcYield = 300e6;   // 300 USDC in native decimals
+        uint256 usdcYield = 300e6; // 300 USDC in native decimals
         uint256 dolaYield = 4000e18; // 4000 DOLA in native decimals
 
         usdcStrategy.setBalances(address(usdcLike), minterAddr, 1000e6, usdcYield);
@@ -1356,11 +1357,7 @@ contract StableYieldAccumulatorTest is Test {
         // Expected: 300e18 (normalized USDC) + 4000e18 (DOLA) = 4300e18
         uint256 expectedNormalizedTotal = 4300e18;
 
-        assertEq(
-            totalYield,
-            expectedNormalizedTotal,
-            "getTotalYield should return normalized sum of 4300e18"
-        );
+        assertEq(totalYield, expectedNormalizedTotal, "getTotalYield should return normalized sum of 4300e18");
 
         // Also verify individual getYield() returns native decimals (NOT normalized)
         uint256 individualUsdcYield = accumulator.getYield(address(usdcStrategy));
@@ -1429,7 +1426,11 @@ contract StableYieldAccumulatorTest is Test {
 
         // Verify payment: 40e18 * 0.98 = 39.2e18
         uint256 expectedPayment = 40e18 * 98 / 100;
-        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive discounted payment for unpaused yield only");
+        assertEq(
+            mockPhlimbo.lastCollectedAmount(),
+            expectedPayment,
+            "Phlimbo should receive discounted payment for unpaused yield only"
+        );
     }
 
     /// @notice claim() returns the same total as calculateClaimAmount() when a token is paused.
@@ -1483,7 +1484,9 @@ contract StableYieldAccumulatorTest is Test {
 
         // The actual payment deducted from claimer should match calculateClaimAmount
         uint256 actualPayment = claimerBalanceBefore - rewardToken.balanceOf(claimer);
-        assertEq(actualPayment, calculatedAmount, "claim() payment should match calculateClaimAmount() when token is paused");
+        assertEq(
+            actualPayment, calculatedAmount, "claim() payment should match calculateClaimAmount() when token is paused"
+        );
     }
 
     /// @notice Regression: claim() works normally when no tokens are paused.
@@ -1577,7 +1580,11 @@ contract StableYieldAccumulatorTest is Test {
         // With forceApprove(), it should succeed (40e18 -> 0 -> 100e18)
         acc.approvePhlimbo(100e18);
 
-        assertEq(usdtToken.allowance(address(acc), address(phlimboMock)), 100e18, "Second approvePhlimbo should succeed with forceApprove");
+        assertEq(
+            usdtToken.allowance(address(acc), address(phlimboMock)),
+            100e18,
+            "Second approvePhlimbo should succeed with forceApprove"
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1639,6 +1646,228 @@ contract StableYieldAccumulatorTest is Test {
 
         // Verify claim went through by checking claimer received yield tokens
         assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claimer should have received yield tokens");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        NUDGE CONFIGURATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_nudge_DefaultsToZeroAddress() public {
+        assertEq(accumulator.nudge(), address(0), "Initial nudge should be zero address");
+    }
+
+    function test_nudgeSplit_DefaultsToZero() public {
+        assertEq(accumulator.nudgeSplit(), 0, "Initial nudgeSplit should be zero");
+    }
+
+    function test_setNudgeAddress_RevertIf_NotOwner() public {
+        address nudgeAddr = makeAddr("nudge");
+        vm.prank(user1);
+        vm.expectRevert();
+        accumulator.setNudgeAddress(nudgeAddr);
+    }
+
+    function test_setNudgeAddress_AllowsZeroAddress() public {
+        address nudgeAddr = makeAddr("nudge");
+        accumulator.setNudgeAddress(nudgeAddr);
+        assertEq(accumulator.nudge(), nudgeAddr);
+
+        vm.expectEmit(true, true, false, true);
+        emit NudgeUpdated(nudgeAddr, address(0));
+        accumulator.setNudgeAddress(address(0));
+
+        assertEq(accumulator.nudge(), address(0), "Nudge should be cleared to zero");
+    }
+
+    function test_setNudgeAddress_StoresAndEmits() public {
+        address nudgeAddr = makeAddr("nudge");
+
+        vm.expectEmit(true, true, false, true);
+        emit NudgeUpdated(address(0), nudgeAddr);
+        accumulator.setNudgeAddress(nudgeAddr);
+
+        assertEq(accumulator.nudge(), nudgeAddr, "Nudge address should be stored");
+
+        // Update to new value, emits old + new
+        address newNudge = makeAddr("newNudge");
+        vm.expectEmit(true, true, false, true);
+        emit NudgeUpdated(nudgeAddr, newNudge);
+        accumulator.setNudgeAddress(newNudge);
+        assertEq(accumulator.nudge(), newNudge, "Nudge address should update");
+    }
+
+    function test_setNudgeSplit_RevertIf_NotOwner() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        accumulator.setNudgeSplit(50);
+    }
+
+    function test_setNudgeSplit_RevertIf_Above100() public {
+        vm.expectRevert(IStableYieldAccumulator.InvalidNudgeSplit.selector);
+        accumulator.setNudgeSplit(101);
+    }
+
+    function test_setNudgeSplit_AcceptsZero() public {
+        // Set to non-zero first so we can observe the update event with old != new
+        accumulator.setNudgeSplit(50);
+
+        vm.expectEmit(false, false, false, true);
+        emit NudgeSplitUpdated(50, 0);
+        accumulator.setNudgeSplit(0);
+
+        assertEq(accumulator.nudgeSplit(), 0, "Split should be 0");
+    }
+
+    function test_setNudgeSplit_AcceptsFifty() public {
+        vm.expectEmit(false, false, false, true);
+        emit NudgeSplitUpdated(0, 50);
+        accumulator.setNudgeSplit(50);
+
+        assertEq(accumulator.nudgeSplit(), 50, "Split should be 50");
+    }
+
+    function test_setNudgeSplit_AcceptsHundredInclusive() public {
+        vm.expectEmit(false, false, false, true);
+        emit NudgeSplitUpdated(0, 100);
+        accumulator.setNudgeSplit(100);
+
+        assertEq(accumulator.nudgeSplit(), 100, "Split should be 100");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        CLAIM SPLIT BEHAVIOR TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_claim_DefaultSplitZero_FullPaymentToPhlimbo() public {
+        // Regression: with default state, claim() routes everything to phlimbo
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+        address nudgeAddr = makeAddr("nudgeRecipient");
+
+        // Note: nudge address is intentionally NOT set; nudgeSplit is also default (0)
+        uint256 expectedPayment = yieldAmount * 98 / 100;
+        uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0);
+
+        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive full payment");
+        assertEq(mockPhlimbo.collectRewardCallCount(), 1, "Phlimbo should be called once");
+        assertEq(rewardToken.balanceOf(nudgeAddr), nudgeBalanceBefore, "Nudge should receive nothing");
+    }
+
+    function test_claim_SplitThirty_PartialNudgeAndPhlimbo() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+        address nudgeAddr = makeAddr("nudgeRecipient");
+
+        accumulator.setNudgeAddress(nudgeAddr);
+        accumulator.setNudgeSplit(30);
+
+        uint256 expectedPayment = yieldAmount * 98 / 100; // 98e18
+        uint256 expectedNudge = expectedPayment * 30 / 100; // 29.4e18
+        uint256 expectedPhlimbo = expectedPayment - expectedNudge; // 68.6e18
+
+        uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0);
+
+        assertEq(
+            rewardToken.balanceOf(nudgeAddr) - nudgeBalanceBefore, expectedNudge, "Nudge should receive 30% of payment"
+        );
+        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPhlimbo, "Phlimbo should receive remainder");
+        assertEq(mockPhlimbo.collectRewardCallCount(), 1, "Phlimbo should still be called");
+    }
+
+    function test_claim_SplitHundred_FullToNudge_PhlimboNotCalled() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+        address nudgeAddr = makeAddr("nudgeRecipient");
+
+        accumulator.setNudgeAddress(nudgeAddr);
+        accumulator.setNudgeSplit(100);
+
+        uint256 expectedPayment = yieldAmount * 98 / 100; // 98e18
+        uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0);
+
+        assertEq(
+            rewardToken.balanceOf(nudgeAddr) - nudgeBalanceBefore, expectedPayment, "Nudge should receive full payment"
+        );
+        assertEq(mockPhlimbo.collectRewardCallCount(), 0, "Phlimbo should NOT be called when split is 100");
+    }
+
+    function test_claim_RevertIf_NudgeSplitSetButAddressUnset() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        // nudgeSplit > 0 but nudge address remains zero
+        accumulator.setNudgeSplit(30);
+
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.NudgeNotConfigured.selector);
+        accumulator.claim(1, 0);
+    }
+
+    function test_claim_NudgeSplitArithmeticPrecision() public {
+        // Setup scenario where actualPayment is small enough for rounding to matter.
+        // Use no discount and identity normalization so the actualPayment equals the yield exactly.
+        address claimer = makeAddr("claimer");
+        address nudgeAddr = makeAddr("nudgeRecipient");
+
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(0); // 0% discount so actualPayment == yield
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+
+        // Don't configure decimals so normalize/denormalize is identity
+        // (decimals==0 and rate==0 => returns amount as-is)
+
+        // actualPayment will be 7
+        uint256 yieldAmount = 7;
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000, yieldAmount);
+        strategyToken1.mint(address(mockStrategy1), yieldAmount);
+
+        rewardToken.mint(claimer, 100);
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        accumulator.approvePhlimbo(type(uint256).max);
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+
+        // Configure nudge with 33% split
+        accumulator.setNudgeAddress(nudgeAddr);
+        accumulator.setNudgeSplit(33);
+
+        // Expected: nudgeAmount = 7 * 33 / 100 = 2 (integer division)
+        // phlimboAmount = 7 - 2 = 5 (NOT 7 * 67 / 100 = 4 which would lose 1 wei)
+        uint256 expectedNudge = 2;
+        uint256 expectedPhlimbo = 5;
+
+        uint256 nudgeBalBefore = rewardToken.balanceOf(nudgeAddr);
+        uint256 accumulatorBalBefore = rewardToken.balanceOf(address(accumulator));
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0);
+
+        uint256 nudgeReceived = rewardToken.balanceOf(nudgeAddr) - nudgeBalBefore;
+        uint256 phlimboReceived = mockPhlimbo.lastCollectedAmount();
+
+        assertEq(nudgeReceived, expectedNudge, "Nudge should receive 2 (floor(7*33/100))");
+        assertEq(phlimboReceived, expectedPhlimbo, "Phlimbo should receive 5 via subtraction");
+        assertEq(nudgeReceived + phlimboReceived, 7, "Sum must equal full actualPayment - no precision loss");
+        // Accumulator should not retain any dust
+        assertEq(
+            rewardToken.balanceOf(address(accumulator)),
+            accumulatorBalBefore,
+            "Accumulator should hold no residual dust"
+        );
     }
 }
 
