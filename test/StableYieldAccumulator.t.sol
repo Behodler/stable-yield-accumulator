@@ -170,6 +170,51 @@ contract MockYieldStrategy is IYieldStrategy {
 }
 
 /**
+ * @title MockRevertingYieldStrategy
+ * @notice Mock yield strategy whose withdrawFrom always reverts; mirrors the audit M-04 PoC.
+ * @dev Reports a non-zero yield via totalBalanceOf/principalOf so that the accumulator's
+ *      claim() will attempt to call withdrawFrom (which then reverts).
+ */
+contract MockRevertingYieldStrategy is IYieldStrategy {
+    error StrategyBroken();
+
+    mapping(address => mapping(address => uint256)) public principals;
+    mapping(address => mapping(address => uint256)) public yields;
+
+    uint256 public withdrawFromCallCount;
+
+    function setBalances(address token, address account, uint256 principal, uint256 yieldAmount) external {
+        principals[token][account] = principal;
+        yields[token][account] = yieldAmount;
+    }
+
+    function deposit(address, uint256, address) external pure override {}
+    function withdraw(address, uint256, address) external pure override {}
+
+    function balanceOf(address token, address account) external view override returns (uint256) {
+        return principals[token][account] + yields[token][account];
+    }
+
+    function principalOf(address token, address account) external view override returns (uint256) {
+        return principals[token][account];
+    }
+
+    function totalBalanceOf(address token, address account) external view override returns (uint256) {
+        return principals[token][account] + yields[token][account];
+    }
+
+    function setClient(address, bool) external pure override {}
+    function emergencyWithdraw(uint256) external pure override {}
+    function totalWithdrawal(address, address) external pure override {}
+
+    /// @notice Always reverts — simulates a broken adapter (audit M-04 PoC pattern)
+    function withdrawFrom(address, address, uint256, address) external override {
+        withdrawFromCallCount++;
+        revert StrategyBroken();
+    }
+}
+
+/**
  * @title MockNFTMinter
  * @notice Mock NFTMinter that implements both INFTMinter functions and ERC1155 balanceOf
  * @dev Simulates the NFTMinter contract for testing the NFT-based claim gate.
@@ -1868,6 +1913,245 @@ contract StableYieldAccumulatorTest is Test {
             accumulatorBalBefore,
             "Accumulator should hold no residual dust"
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                EXEMPT STRATEGIES TESTS (Story 024 / Audit M-04)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Sets up two healthy registered strategies with yield. Returns the claimer.
+     * @dev Mirrors _setupClaimScenario but registers both mockStrategy1 and mockStrategy2.
+     */
+    function _setupTwoStrategiesScenario(uint256 yield1, uint256 yield2) internal returns (address claimer) {
+        claimer = makeAddr("claimer");
+
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200); // 2% discount
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
+
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yield1);
+        mockStrategy2.setBalances(address(strategyToken2), minterAddr, 500e18, yield2);
+
+        strategyToken1.mint(address(mockStrategy1), yield1);
+        strategyToken2.mint(address(mockStrategy2), yield2);
+
+        // Fund claimer with enough to cover full discounted yield (with buffer)
+        uint256 totalYield = yield1 + yield2;
+        rewardToken.mint(claimer, totalYield + 1e18);
+
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+
+        accumulator.approvePhlimbo(type(uint256).max);
+
+        mockNFTMinter.mintNFT(claimer, 1, 5); // 5 NFTs for repeat claims
+    }
+
+    /// @notice Red-phase: claim() with an unregistered exempt entry reverts ExemptStrategyNotRegistered.
+    function test_claim_RevertsOnUnregisteredExemptEntry() public {
+        address claimer = _setupTwoStrategiesScenario(60e18, 40e18);
+
+        address[] memory exempt = new address[](1);
+        exempt[0] = makeAddr("nope");
+
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.ExemptStrategyNotRegistered.selector);
+        accumulator.claim(1, 0, exempt);
+    }
+
+    /// @notice Red-phase: a previously-registered-then-removed strategy is not a valid exempt entry.
+    function test_claim_RevertsOnExemptedStrategyAfterRemoval() public {
+        address claimer = _setupTwoStrategiesScenario(60e18, 40e18);
+
+        // Remove strategy2 — it is now no longer registered
+        accumulator.removeYieldStrategy(address(mockStrategy2));
+
+        address[] memory exempt = new address[](1);
+        exempt[0] = address(mockStrategy2);
+
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.ExemptStrategyNotRegistered.selector);
+        accumulator.claim(1, 0, exempt);
+    }
+
+    /// @notice Green-phase: empty exempt list preserves byte-for-byte original claim() behavior.
+    function test_claim_EmptyExemptListBehavesLikeBefore() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        uint256 expectedPayment = yieldAmount * 98 / 100;
+        uint256 claimerRewardBefore = rewardToken.balanceOf(claimer);
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+        uint256 phlimboRewardBefore = rewardToken.balanceOf(phlimboAddr);
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0, new address[](0));
+
+        assertEq(
+            claimerRewardBefore - rewardToken.balanceOf(claimer),
+            expectedPayment,
+            "Claimer should pay full discounted amount with empty exempt list"
+        );
+        assertEq(
+            rewardToken.balanceOf(phlimboAddr) - phlimboRewardBefore,
+            expectedPayment,
+            "Phlimbo should receive full payment with empty exempt list"
+        );
+        assertEq(
+            strategyToken1.balanceOf(claimer) - claimerYieldBefore,
+            yieldAmount,
+            "Claimer should receive full yield with empty exempt list"
+        );
+        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "withdrawFrom should be called once");
+    }
+
+    /// @notice Green-phase: an exempted strategy is fully skipped — withdrawFrom is never invoked.
+    function test_claim_SkipsExemptedStrategy() public {
+        uint256 yield1 = 60e18;
+        uint256 yield2 = 40e18;
+        address claimer = _setupTwoStrategiesScenario(yield1, yield2);
+
+        address[] memory exempt = new address[](1);
+        exempt[0] = address(mockStrategy2);
+
+        uint256 claimerYield1Before = strategyToken1.balanceOf(claimer);
+        uint256 claimerYield2Before = strategyToken2.balanceOf(claimer);
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0, exempt);
+
+        // Strategy1 paid out, strategy2 was skipped
+        assertEq(
+            strategyToken1.balanceOf(claimer) - claimerYield1Before,
+            yield1,
+            "Claimer should receive yield from non-exempt strategy1"
+        );
+        assertEq(
+            strategyToken2.balanceOf(claimer) - claimerYield2Before,
+            0,
+            "Claimer should NOT receive yield from exempt strategy2"
+        );
+        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "strategy1 withdrawFrom called once");
+        assertEq(mockStrategy2.withdrawFromCallCount(), 0, "strategy2 withdrawFrom never called");
+
+        // Payment should equal only the non-exempt yield (with discount)
+        uint256 expectedPayment = yield1 * 98 / 100;
+        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo received only strategy1 share");
+    }
+
+    /// @notice Green-phase / M-04 mitigation: a reverting strategy bricks claim() unless exempted.
+    function test_claim_RoutesAroundRevertingStrategy() public {
+        address claimer = makeAddr("claimer");
+
+        // Setup
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setRewardToken(address(rewardToken));
+        accumulator.setMinter(minterAddr);
+        accumulator.setDiscountRate(200);
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        // Healthy strategy
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+
+        // Broken strategy — always reverts on withdrawFrom
+        MockRevertingYieldStrategy broken = new MockRevertingYieldStrategy();
+        accumulator.addYieldStrategy(address(broken), address(strategyToken2));
+
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        uint256 healthyYield = 60e18;
+        uint256 brokenYield = 40e18;
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, healthyYield);
+        broken.setBalances(address(strategyToken2), minterAddr, 500e18, brokenYield);
+
+        strategyToken1.mint(address(mockStrategy1), healthyYield);
+        // Broken strategy doesn't need underlying balance — it reverts before transferring
+
+        rewardToken.mint(claimer, 200e18);
+        vm.prank(claimer);
+        rewardToken.approve(address(accumulator), type(uint256).max);
+        accumulator.approvePhlimbo(type(uint256).max);
+
+        mockNFTMinter.mintNFT(claimer, 1, 2);
+
+        // Without exemption: claim reverts (broken strategy bricks the loop)
+        vm.prank(claimer);
+        vm.expectRevert(MockRevertingYieldStrategy.StrategyBroken.selector);
+        accumulator.claim(1, 0, new address[](0));
+
+        // With broken strategy exempted: claim succeeds and pays only the healthy yield
+        address[] memory exempt = new address[](1);
+        exempt[0] = address(broken);
+
+        uint256 claimerHealthyBefore = strategyToken1.balanceOf(claimer);
+        vm.prank(claimer);
+        accumulator.claim(1, 0, exempt);
+
+        assertEq(
+            strategyToken1.balanceOf(claimer) - claimerHealthyBefore,
+            healthyYield,
+            "Claimer should receive healthy strategy's yield"
+        );
+        assertEq(broken.withdrawFromCallCount(), 0, "Broken strategy's withdrawFrom must never run");
+
+        uint256 expectedPayment = healthyYield * 98 / 100;
+        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo received only healthy share");
+    }
+
+    /// @notice Green-phase: exempting all strategies surfaces the existing ZeroAmount revert.
+    function test_claim_AllStrategiesExemptedRevertsZeroAmount() public {
+        address claimer = _setupTwoStrategiesScenario(60e18, 40e18);
+
+        address[] memory exempt = new address[](2);
+        exempt[0] = address(mockStrategy1);
+        exempt[1] = address(mockStrategy2);
+
+        // Note: this consumes the NFT — that is intentional per spec
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
+        accumulator.claim(1, 0, exempt);
+    }
+
+    /// @notice Green-phase: calculateClaimAmount mirrors claim's exemption logic.
+    function test_calculateClaimAmount_MirrorsClaimWithExemptions() public {
+        uint256 yield1 = 60e18;
+        uint256 yield2 = 40e18;
+        address claimer = _setupTwoStrategiesScenario(yield1, yield2);
+
+        // Preview: exempt strategy2, expect only strategy1's discounted yield
+        address[] memory exempt = new address[](1);
+        exempt[0] = address(mockStrategy2);
+
+        uint256 previewedAmount = accumulator.calculateClaimAmount(exempt);
+        uint256 expectedPayment = yield1 * 98 / 100;
+        assertEq(previewedAmount, expectedPayment, "Preview should match exempted-strategy yield with discount");
+
+        // Now claim with the same exemption AND the previewed amount as min slippage —
+        // claim should succeed and consume exactly previewedAmount from the claimer.
+        uint256 claimerBefore = rewardToken.balanceOf(claimer);
+        vm.prank(claimer);
+        accumulator.claim(1, previewedAmount, exempt);
+        uint256 claimerAfter = rewardToken.balanceOf(claimer);
+
+        assertEq(claimerBefore - claimerAfter, previewedAmount, "claim() must consume exactly the previewed amount");
+
+        // calculateClaimAmount also reverts on bad exempt entries — confirms full mirroring
+        address[] memory bad = new address[](1);
+        bad[0] = makeAddr("nope");
+        vm.expectRevert(IStableYieldAccumulator.ExemptStrategyNotRegistered.selector);
+        accumulator.calculateClaimAmount(bad);
     }
 }
 
