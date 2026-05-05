@@ -137,6 +137,13 @@ interface IStableYieldAccumulator {
     error StrategyAlreadyRegistered();
 
     /**
+     * @notice Thrown when claim() is called with an exemptStrategies entry that is not a registered strategy
+     * @dev Distinct from StrategyNotRegistered so offchain callers can disambiguate
+     *      "I passed garbage in exemptStrategies" from internal lookup failures
+     */
+    error ExemptStrategyNotRegistered();
+
+    /**
      * @notice Thrown when trying to claim more than available pending rewards
      */
     error InsufficientPending();
@@ -318,24 +325,39 @@ interface IStableYieldAccumulator {
     /**
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full flow:
-     *      1. Verify caller holds a valid NFT at the given index and burn 1 unit
-     *      2. Calculate total pending yield (normalized)
-     *      3. Apply discount to get claimer payment
-     *      4. TransferFrom claimer to phlimbo
-     *      5. WithdrawFrom each strategy to claimer
+     *      1. Validate every entry in exemptStrategies is currently registered (BEFORE the NFT burn)
+     *      2. Verify caller holds a valid NFT at the given index and burn 1 unit
+     *      3. Iterate registered strategies, skipping any present in exemptStrategies
+     *      4. Calculate total pending yield (normalized) from non-exempt strategies
+     *      5. Apply discount to get claimer payment
+     *      6. TransferFrom claimer to phlimbo
+     *      7. WithdrawFrom each non-exempt strategy to claimer
      * @param nftIndex The dispatcher config index in NFTMinter identifying which NFT to validate and burn
      * @param minRewardTokenSupplied Minimum acceptable payment amount in reward token decimals.
      *        Reverts with InsufficientYield if actual payment is less than this value.
      *        Pass 0 to disable slippage protection.
+     * @param exemptStrategies List of registered strategies to skip during the iteration.
+     *        Empty array preserves pre-existing behavior (no filtering).
+     *        Each entry must satisfy isRegisteredStrategy[entry] == true or the call reverts
+     *        with ExemptStrategyNotRegistered. Validation runs before the NFT is burned so a
+     *        bad input does not consume the caller's NFT. Intended use: route around a
+     *        misbehaving strategy (e.g. one whose withdrawFrom reverts) until owner remediation
+     *        via removeYieldStrategy or per-token paused flag.
      */
-    function claim(uint256 nftIndex, uint256 minRewardTokenSupplied) external;
+    function claim(uint256 nftIndex, uint256 minRewardTokenSupplied, address[] calldata exemptStrategies) external;
 
     /**
      * @notice Calculates how much the claimer would pay for total pending yield
-     * @dev Returns the discounted amount in reward token decimals
+     * @dev Returns the discounted amount in reward token decimals. Mirrors claim() so
+     *      claimers can preview the payment they'll commit to with the same exemptions
+     *      they'll pass to claim() (used to compute minRewardTokenSupplied for slippage).
+     * @param exemptStrategies List of registered strategies to skip during the calculation.
+     *        Empty array preserves pre-existing behavior. Each entry must satisfy
+     *        isRegisteredStrategy[entry] == true or the call reverts with
+     *        ExemptStrategyNotRegistered.
      * @return Amount of reward token claimer would pay
      */
-    function calculateClaimAmount() external view returns (uint256);
+    function calculateClaimAmount(address[] calldata exemptStrategies) external view returns (uint256);
 
     /*//////////////////////////////////////////////////////////////
                         YIELD CALCULATION
