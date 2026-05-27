@@ -1,0 +1,6 @@
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+pauser/=lib/pauser/src/
+vault/=lib/vault/src/
+phlimbo-ea/=lib/phlimbo-ea/src/
+yield-claim-nft/=lib/yield-claim-nft/src/
+forge-std/=lib/forge-std/src/
