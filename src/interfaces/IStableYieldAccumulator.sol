@@ -267,18 +267,6 @@ interface IStableYieldAccumulator {
      */
     function phlimbo() external view returns (address);
 
-    /**
-     * @notice Sets the minter address that holds deposits in yield strategies
-     * @param _minter Address of the minter contract
-     */
-    function setMinter(address _minter) external;
-
-    /**
-     * @notice Gets the current minter address
-     * @return Address of the minter contract
-     */
-    function minterAddress() external view returns (address);
-
     /*//////////////////////////////////////////////////////////////
                             NUDGE MANAGEMENT
     //////////////////////////////////////////////////////////////*/
@@ -331,7 +319,8 @@ interface IStableYieldAccumulator {
      *      4. Calculate total pending yield (normalized) from non-exempt strategies
      *      5. Apply discount to get claimer payment
      *      6. TransferFrom claimer to phlimbo
-     *      7. WithdrawFrom each non-exempt strategy to claimer
+     *      7. skimSurplus each non-exempt strategy, sending the batched surplus of all its
+     *         authorized clients to the claimer
      * @param nftIndex The dispatcher config index in NFTMinter identifying which NFT to validate and burn
      * @param minRewardTokenSupplied Minimum acceptable payment amount in reward token decimals.
      *        Reverts with InsufficientYield if actual payment is less than this value.
@@ -341,7 +330,7 @@ interface IStableYieldAccumulator {
      *        Each entry must satisfy isRegisteredStrategy[entry] == true or the call reverts
      *        with ExemptStrategyNotRegistered. Validation runs before the NFT is burned so a
      *        bad input does not consume the caller's NFT. Intended use: route around a
-     *        misbehaving strategy (e.g. one whose withdrawFrom reverts) until owner remediation
+     *        misbehaving strategy (e.g. one whose skimSurplus reverts) until owner remediation
      *        via removeYieldStrategy or per-token paused flag.
      */
     function claim(uint256 nftIndex, uint256 minRewardTokenSupplied, address[] calldata exemptStrategies) external;

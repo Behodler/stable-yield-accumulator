@@ -112,12 +112,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     uint256 public nudgeSplit;
 
     /**
-     * @notice Address of the minter contract that holds deposits in yield strategies
-     * @dev Used to query yield strategies for the minter's accumulated yield
-     */
-    address public minterAddress;
-
-    /**
      * @notice Mapping to check if a strategy is registered (O(1) lookup)
      * @dev Used to avoid O(n) iteration for duplicate/existence checks
      */
@@ -149,13 +143,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @param newPauser New pauser address (may be address(0) to remove pauser)
      */
     event PauserUpdated(address indexed oldPauser, address indexed newPauser);
-
-    /**
-     * @notice Emitted when the minter address is updated
-     * @param oldMinter Previous minter address (may be address(0))
-     * @param newMinter New minter address
-     */
-    event MinterUpdated(address indexed oldMinter, address indexed newMinter);
 
     /**
      * @notice Emitted when the NFT minter address is updated
@@ -367,18 +354,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /**
-     * @notice Sets the minter address that holds deposits in yield strategies
-     * @param _minter Address of the minter contract
-     */
-    function setMinter(address _minter) external onlyOwner {
-        if (_minter == address(0)) revert ZeroAddress();
-
-        address oldMinter = minterAddress;
-        minterAddress = _minter;
-        emit MinterUpdated(oldMinter, _minter);
-    }
-
-    /**
      * @notice Sets the reward token address
      * @param _rewardToken Address of the reward token (e.g., USDC)
      */
@@ -455,7 +430,8 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      *      3. Calculate total pending yield across all non-exempt strategies (normalized to 18 decimals)
      *      4. Apply discount to get claimer payment amount
      *      5. Transfer rewardToken FROM claimer TO phlimbo
-     *      6. Withdraw yield FROM each non-exempt strategy TO claimer
+     *      6. skimSurplus each non-exempt strategy, sending the batched surplus of ALL its
+     *         authorized clients TO the claimer
      * @param nftIndex Dispatcher config index in NFTMinter for the NFT to validate and burn
      * @param minRewardTokenSupplied Slippage protection; reverts with InsufficientYield if actual
      *        payment is less than this value. Pass 0 to disable.
@@ -472,7 +448,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     {
         if (phlimbo == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
-        if (minterAddress == address(0)) revert ZeroAddress();
 
         // Validate exempt entries before burning NFT so a bad input does not consume the NFT
         for (uint256 i = 0; i < exemptStrategies.length; i++) {
@@ -503,14 +478,15 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             }
             if (exempt) continue;
 
-            uint256 yield = _getYieldForStrategy(strategy, token);
-            if (yield > 0) {
-                // Withdraw yield from strategy to claimer
-                IYieldStrategy(strategy).withdrawFrom(token, minterAddress, yield, msg.sender);
-                emit RewardsCollected(strategy, yield);
+            // skimSurplus batch-withdraws the surplus of ALL authorized clients to the claimer and
+            // returns the actual underlying delivered. The "is there surplus / which clients" logic is
+            // internalized, so no pre-check / conditional call is needed — emit/accumulate only if > 0.
+            uint256 underlyingReceived = IYieldStrategy(strategy).skimSurplus(token, msg.sender);
+            if (underlyingReceived > 0) {
+                emit RewardsCollected(strategy, underlyingReceived);
 
                 // Accumulate normalized yield for payment calculation
-                totalNormalizedYield += _normalizeAmount(yield, token);
+                totalNormalizedYield += _normalizeAmount(underlyingReceived, token);
                 strategiesWithYield++;
             }
         }
@@ -564,20 +540,27 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /**
-     * @notice Internal helper to get yield for a specific strategy
+     * @notice Internal helper to get pending yield for a specific strategy
+     * @dev This is an ESTIMATE only: it aggregates the surplus (totalBalanceOf - principalOf)
+     *      across every authorized client of the strategy. The actual amount delivered by a
+     *      claim is the value returned by skimSurplus(), which can diverge from this snapshot
+     *      due to redeem/swap/rounding/slippage. minRewardTokenSupplied covers that divergence.
      * @param strategy Address of the yield strategy
      * @param token Address of the strategy's underlying token
-     * @return yield The pending yield amount
+     * @return yield The pending yield amount (estimate, native token decimals)
      */
     function _getYieldForStrategy(address strategy, address token) internal view returns (uint256) {
         IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
-        uint256 totalBalance = yieldStrategy.totalBalanceOf(token, minterAddress);
-        uint256 principal = yieldStrategy.principalOf(token, minterAddress);
-
-        if (totalBalance > principal) {
-            return totalBalance - principal;
+        address[] memory clients = yieldStrategy.getAuthorizedClients();
+        uint256 yield = 0;
+        for (uint256 i = 0; i < clients.length; i++) {
+            uint256 totalBalance = yieldStrategy.totalBalanceOf(token, clients[i]);
+            uint256 principal = yieldStrategy.principalOf(token, clients[i]);
+            if (totalBalance > principal) {
+                yield += totalBalance - principal;
+            }
         }
-        return 0;
+        return yield;
     }
 
     /**
@@ -666,8 +649,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @return paymentAmount Amount of reward token claimer would pay (in reward token decimals)
      */
     function calculateClaimAmount(address[] calldata exemptStrategies) external view override returns (uint256) {
-        if (minterAddress == address(0)) return 0;
-
         // Validate exempt entries are registered (mirrors claim() so the preview matches)
         for (uint256 i = 0; i < exemptStrategies.length; i++) {
             if (!isRegisteredStrategy[exemptStrategies[i]]) revert ExemptStrategyNotRegistered();
@@ -741,21 +722,13 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      */
     function getYield(address strategy) external view override returns (uint256) {
         if (!isRegisteredStrategy[strategy]) revert StrategyNotRegistered();
-        if (minterAddress == address(0)) return 0;
 
         address token = strategyTokens[strategy];
         if (token == address(0)) return 0;
 
-        // Query the yield strategy for minter's total balance and principal
-        IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
-        uint256 totalBalance = yieldStrategy.totalBalanceOf(token, minterAddress);
-        uint256 principal = yieldStrategy.principalOf(token, minterAddress);
-
-        // Yield = total balance - principal (accumulated yield)
-        if (totalBalance > principal) {
-            return totalBalance - principal;
-        }
-        return 0;
+        // Aggregate the strategy's pending yield across all authorized clients (estimate).
+        // The single source of truth is _getYieldForStrategy.
+        return _getYieldForStrategy(strategy, token);
     }
 
     /**
@@ -763,8 +736,6 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @return Total pending yield normalized to 18 decimals
      */
     function getTotalYield() external view override returns (uint256) {
-        if (minterAddress == address(0)) return 0;
-
         uint256 total = 0;
         for (uint256 i = 0; i < yieldStrategies.length; i++) {
             address strategy = yieldStrategies[i];

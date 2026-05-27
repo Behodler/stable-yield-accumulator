@@ -111,16 +111,40 @@ contract MockYieldStrategy is IYieldStrategy {
     mapping(address => mapping(address => uint256)) public principals;
     mapping(address => mapping(address => uint256)) public yields;
 
-    // Track withdrawFrom calls for testing
-    uint256 public withdrawFromCallCount;
-    address public lastWithdrawToken;
-    address public lastWithdrawClient;
-    uint256 public lastWithdrawAmount;
-    address public lastWithdrawRecipient;
+    // Authorized client set the strategy owns and skims over
+    address[] public clients;
+    mapping(address => bool) public isClient;
 
+    // Track skimSurplus calls for testing
+    uint256 public skimSurplusCallCount;
+    address public lastSkimToken;
+    address public lastSkimRecipient;
+    uint256 public lastSkimAmount;
+
+    /**
+     * @notice Sets balances for an account and auto-registers it as an authorized client.
+     * @dev Auto-registration keeps existing test setup working; getAuthorizedClients() then
+     *      returns every account that has had balances set, matching the new all-clients model.
+     */
     function setBalances(address token, address account, uint256 principal, uint256 yieldAmount) external {
         principals[token][account] = principal;
         yields[token][account] = yieldAmount;
+        if (!isClient[account]) {
+            isClient[account] = true;
+            clients.push(account);
+        }
+    }
+
+    /// @notice Explicitly add an authorized client (without setting balances)
+    function addClient(address account) external {
+        if (!isClient[account]) {
+            isClient[account] = true;
+            clients.push(account);
+        }
+    }
+
+    function getAuthorizedClients() external view override returns (address[] memory) {
+        return clients;
     }
 
     function deposit(address, uint256, address) external pure override {}
@@ -143,37 +167,43 @@ contract MockYieldStrategy is IYieldStrategy {
     function totalWithdrawal(address, address) external pure override {}
 
     /**
-     * @notice Mock withdrawFrom that transfers tokens to recipient
-     * @dev Actually transfers ERC20 tokens from this contract to recipient
+     * @notice Mock skimSurplus that batch-withdraws the surplus of all authorized clients.
+     * @dev Sums yields[token][client] over the authorized client set, transfers the total to
+     *      recipient, zeroes those yields, and returns the actual amount delivered.
      */
-    function withdrawFrom(address token, address client, uint256 amount, address recipient) external override {
-        withdrawFromCallCount++;
-        lastWithdrawToken = token;
-        lastWithdrawClient = client;
-        lastWithdrawAmount = amount;
-        lastWithdrawRecipient = recipient;
+    function skimSurplus(address token, address recipient) external override returns (uint256) {
+        skimSurplusCallCount++;
+        lastSkimToken = token;
+        lastSkimRecipient = recipient;
 
-        // Actually transfer tokens from this contract to recipient
-        IERC20(token).transfer(recipient, amount);
+        uint256 total = 0;
+        for (uint256 i = 0; i < clients.length; i++) {
+            address client = clients[i];
+            total += yields[token][client];
+            yields[token][client] = 0;
+        }
 
-        // Reduce yield after withdrawal
-        yields[token][client] -= amount;
+        lastSkimAmount = total;
+
+        if (total > 0) {
+            IERC20(token).transfer(recipient, total);
+        }
+        return total;
     }
 
-    function resetWithdrawTracking() external {
-        withdrawFromCallCount = 0;
-        lastWithdrawToken = address(0);
-        lastWithdrawClient = address(0);
-        lastWithdrawAmount = 0;
-        lastWithdrawRecipient = address(0);
+    function resetSkimTracking() external {
+        skimSurplusCallCount = 0;
+        lastSkimToken = address(0);
+        lastSkimRecipient = address(0);
+        lastSkimAmount = 0;
     }
 }
 
 /**
  * @title MockRevertingYieldStrategy
- * @notice Mock yield strategy whose withdrawFrom always reverts; mirrors the audit M-04 PoC.
- * @dev Reports a non-zero yield via totalBalanceOf/principalOf so that the accumulator's
- *      claim() will attempt to call withdrawFrom (which then reverts).
+ * @notice Mock yield strategy whose skimSurplus always reverts; mirrors the audit M-04 PoC.
+ * @dev Reports a non-zero yield via totalBalanceOf/principalOf so the preview shows surplus,
+ *      but skimSurplus reverts so the accumulator's claim() bricks unless the strategy is exempted.
  */
 contract MockRevertingYieldStrategy is IYieldStrategy {
     error StrategyBroken();
@@ -181,11 +211,22 @@ contract MockRevertingYieldStrategy is IYieldStrategy {
     mapping(address => mapping(address => uint256)) public principals;
     mapping(address => mapping(address => uint256)) public yields;
 
-    uint256 public withdrawFromCallCount;
+    address[] public clients;
+    mapping(address => bool) public isClient;
+
+    uint256 public skimSurplusCallCount;
 
     function setBalances(address token, address account, uint256 principal, uint256 yieldAmount) external {
         principals[token][account] = principal;
         yields[token][account] = yieldAmount;
+        if (!isClient[account]) {
+            isClient[account] = true;
+            clients.push(account);
+        }
+    }
+
+    function getAuthorizedClients() external view override returns (address[] memory) {
+        return clients;
     }
 
     function deposit(address, uint256, address) external pure override {}
@@ -208,8 +249,8 @@ contract MockRevertingYieldStrategy is IYieldStrategy {
     function totalWithdrawal(address, address) external pure override {}
 
     /// @notice Always reverts — simulates a broken adapter (audit M-04 PoC pattern)
-    function withdrawFrom(address, address, uint256, address) external override {
-        withdrawFromCallCount++;
+    function skimSurplus(address, address) external override returns (uint256) {
+        skimSurplusCallCount++;
         revert StrategyBroken();
     }
 }
@@ -329,7 +370,6 @@ contract StableYieldAccumulatorTest is Test {
 
     // Events to test
     event PauserUpdated(address indexed oldPauser, address indexed newPauser);
-    event MinterUpdated(address indexed oldMinter, address indexed newMinter);
     event NFTMinterUpdated(address indexed oldNFTMinter, address indexed newNFTMinter);
     event Paused(address account);
     event Unpaused(address account);
@@ -744,29 +784,6 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                        MINTER MANAGEMENT
-    //////////////////////////////////////////////////////////////*/
-
-    function test_setMinter_StoresAddress() public {
-        vm.expectEmit(true, true, false, true);
-        emit MinterUpdated(address(0), minterAddr);
-        accumulator.setMinter(minterAddr);
-
-        assertEq(accumulator.minterAddress(), minterAddr, "Should store minter address");
-    }
-
-    function test_setMinter_RevertIf_ZeroAddress() public {
-        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.setMinter(address(0));
-    }
-
-    function test_setMinter_RevertIf_NotOwner() public {
-        vm.prank(user1);
-        vm.expectRevert();
-        accumulator.setMinter(minterAddr);
-    }
-
-    /*//////////////////////////////////////////////////////////////
                         CLAIM MECHANISM - FULL FLOW TESTS
     //////////////////////////////////////////////////////////////*/
 
@@ -780,7 +797,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup accumulator config
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2% discount
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -845,19 +861,18 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(claimerYieldAfter - claimerYieldBefore, yieldAmount, "Claimer should have received yield tokens");
     }
 
-    function test_claim_CallsWithdrawFromOnStrategy() public {
+    function test_claim_CallsSkimSurplusOnStrategy() public {
         uint256 yieldAmount = 50e18;
         address claimer = _setupClaimScenario(yieldAmount);
 
         vm.prank(claimer);
         accumulator.claim(1, 0, new address[](0));
 
-        // Verify withdrawFrom was called with correct parameters
-        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "withdrawFrom should be called once");
-        assertEq(mockStrategy1.lastWithdrawToken(), address(strategyToken1), "Should withdraw correct token");
-        assertEq(mockStrategy1.lastWithdrawClient(), minterAddr, "Should withdraw from minter");
-        assertEq(mockStrategy1.lastWithdrawAmount(), yieldAmount, "Should withdraw full yield");
-        assertEq(mockStrategy1.lastWithdrawRecipient(), claimer, "Should send to claimer");
+        // Verify skimSurplus was called with correct parameters
+        assertEq(mockStrategy1.skimSurplusCallCount(), 1, "skimSurplus should be called once");
+        assertEq(mockStrategy1.lastSkimToken(), address(strategyToken1), "Should skim correct token");
+        assertEq(mockStrategy1.lastSkimRecipient(), claimer, "Should send to claimer");
+        assertEq(mockStrategy1.lastSkimAmount(), yieldAmount, "Should skim full surplus");
     }
 
     function test_claim_MultipleStrategies() public {
@@ -866,7 +881,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup both strategies
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200);
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -904,9 +918,9 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
         assertEq(strategyToken2.balanceOf(claimer), 40e18, "Should receive yield from strategy2");
 
-        // Verify both strategies had withdrawFrom called
-        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "Strategy1 withdrawFrom called");
-        assertEq(mockStrategy2.withdrawFromCallCount(), 1, "Strategy2 withdrawFrom called");
+        // Verify both strategies had skimSurplus called
+        assertEq(mockStrategy1.skimSurplusCallCount(), 1, "Strategy1 skimSurplus called");
+        assertEq(mockStrategy2.skimSurplusCallCount(), 1, "Strategy2 skimSurplus called");
     }
 
     function test_claim_EmitsEvents() public {
@@ -945,7 +959,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup without any yield
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setNFTMinter(address(mockNFTMinter));
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
@@ -963,7 +976,6 @@ contract StableYieldAccumulatorTest is Test {
 
     function test_claim_RevertIf_PhlimboNotSet() public {
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
         accumulator.claim(1, 0, new address[](0));
@@ -971,15 +983,6 @@ contract StableYieldAccumulatorTest is Test {
 
     function test_claim_RevertIf_RewardTokenNotSet() public {
         accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setMinter(minterAddr);
-
-        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
-        accumulator.claim(1, 0, new address[](0));
-    }
-
-    function test_claim_RevertIf_MinterNotSet() public {
-        accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setRewardToken(address(rewardToken));
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
         accumulator.claim(1, 0, new address[](0));
@@ -1010,7 +1013,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(0); // No discount
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
@@ -1025,15 +1027,8 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_calculateClaimAmount_ZeroIfNoStrategies() public {
-        accumulator.setMinter(minterAddr);
-
         uint256 payment = accumulator.calculateClaimAmount(new address[](0));
         assertEq(payment, 0, "Should return 0 if no strategies");
-    }
-
-    function test_calculateClaimAmount_ZeroIfMinterNotSet() public {
-        uint256 payment = accumulator.calculateClaimAmount(new address[](0));
-        assertEq(payment, 0, "Should return 0 if minter not set");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1043,7 +1038,6 @@ contract StableYieldAccumulatorTest is Test {
     function test_getYield_ReturnsActualYieldFromStrategy() public {
         // Setup strategy with token and minter
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-        accumulator.setMinter(minterAddr);
 
         // Set mock strategy to return specific balances for minter
         uint256 principal = 1000e18;
@@ -1055,17 +1049,16 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(yield, yieldAmount, "Should return actual yield from strategy");
     }
 
-    function test_getYield_ReturnsZeroIfMinterNotSet() public {
+    function test_getYield_ReturnsZeroIfNoClients() public {
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-        // Don't set minter
+        // No clients registered on the strategy
 
         uint256 yield = accumulator.getYield(address(mockStrategy1));
-        assertEq(yield, 0, "Should return 0 if minter not set");
+        assertEq(yield, 0, "Should return 0 when strategy has no authorized clients");
     }
 
     function test_getYield_ReturnsZeroIfNoYield() public {
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-        accumulator.setMinter(minterAddr);
 
         // Set principal but no yield
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 0);
@@ -1083,7 +1076,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup two strategies
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
-        accumulator.setMinter(minterAddr);
 
         // Set mock balances for both strategies
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 50e18); // 50 yield
@@ -1094,19 +1086,8 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_getTotalYield_ReturnsZeroIfNoStrategies() public {
-        accumulator.setMinter(minterAddr);
-
         uint256 totalYield = accumulator.getTotalYield();
         assertEq(totalYield, 0, "Should return 0 if no strategies registered");
-    }
-
-    function test_getTotalYield_ReturnsZeroIfMinterNotSet() public {
-        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 50e18);
-
-        // Don't set minter
-        uint256 totalYield = accumulator.getTotalYield();
-        assertEq(totalYield, 0, "Should return 0 if minter not set");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1164,7 +1145,6 @@ contract StableYieldAccumulatorTest is Test {
 
         // 4. Set phlimbo and minter
         accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setMinter(minterAddr);
 
         // 5. Set reward token
         accumulator.setRewardToken(address(rewardToken));
@@ -1208,7 +1188,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
-        accumulator.setMinter(minterAddr);
 
         // Set mock balances
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 25e18);
@@ -1377,7 +1356,6 @@ contract StableYieldAccumulatorTest is Test {
         MockYieldStrategy dolaStrategy = new MockYieldStrategy();
 
         // Setup accumulator
-        accumulator.setMinter(minterAddr);
 
         // Add strategies
         accumulator.addYieldStrategy(address(usdcStrategy), address(usdcLike));
@@ -1424,7 +1402,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup two strategies
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2%
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -1465,9 +1442,9 @@ contract StableYieldAccumulatorTest is Test {
         // Claimer SHOULD receive strategyToken2 yield
         assertEq(strategyToken2.balanceOf(claimer), 40e18, "Should receive yield from unpaused token");
 
-        // Only strategy2 should have had withdrawFrom called
-        assertEq(mockStrategy1.withdrawFromCallCount(), 0, "Paused strategy should not be called");
-        assertEq(mockStrategy2.withdrawFromCallCount(), 1, "Unpaused strategy should be called");
+        // Only strategy2 should have had skimSurplus called
+        assertEq(mockStrategy1.skimSurplusCallCount(), 0, "Paused strategy should not be called");
+        assertEq(mockStrategy2.skimSurplusCallCount(), 1, "Unpaused strategy should be called");
 
         // Verify payment: 40e18 * 0.98 = 39.2e18
         uint256 expectedPayment = 40e18 * 98 / 100;
@@ -1485,7 +1462,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup two strategies
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2%
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -1541,7 +1517,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup two strategies — no tokens paused
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2%
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -1578,9 +1553,9 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(strategyToken1.balanceOf(claimer), 60e18, "Should receive yield from strategy1");
         assertEq(strategyToken2.balanceOf(claimer), 40e18, "Should receive yield from strategy2");
 
-        // Both strategies should have had withdrawFrom called
-        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "Strategy1 withdrawFrom called");
-        assertEq(mockStrategy2.withdrawFromCallCount(), 1, "Strategy2 withdrawFrom called");
+        // Both strategies should have had skimSurplus called
+        assertEq(mockStrategy1.skimSurplusCallCount(), 1, "Strategy1 skimSurplus called");
+        assertEq(mockStrategy2.skimSurplusCallCount(), 1, "Strategy2 skimSurplus called");
 
         // Verify payment: 100e18 * 0.98 = 98e18
         uint256 expectedPayment = 100e18 * 98 / 100;
@@ -1865,7 +1840,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(0); // 0% discount so actualPayment == yield
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -1928,7 +1902,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2% discount
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -2012,10 +1985,10 @@ contract StableYieldAccumulatorTest is Test {
             yieldAmount,
             "Claimer should receive full yield with empty exempt list"
         );
-        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "withdrawFrom should be called once");
+        assertEq(mockStrategy1.skimSurplusCallCount(), 1, "skimSurplus should be called once");
     }
 
-    /// @notice Green-phase: an exempted strategy is fully skipped — withdrawFrom is never invoked.
+    /// @notice Green-phase: an exempted strategy is fully skipped — skimSurplus is never invoked.
     function test_claim_SkipsExemptedStrategy() public {
         uint256 yield1 = 60e18;
         uint256 yield2 = 40e18;
@@ -2041,8 +2014,8 @@ contract StableYieldAccumulatorTest is Test {
             0,
             "Claimer should NOT receive yield from exempt strategy2"
         );
-        assertEq(mockStrategy1.withdrawFromCallCount(), 1, "strategy1 withdrawFrom called once");
-        assertEq(mockStrategy2.withdrawFromCallCount(), 0, "strategy2 withdrawFrom never called");
+        assertEq(mockStrategy1.skimSurplusCallCount(), 1, "strategy1 skimSurplus called once");
+        assertEq(mockStrategy2.skimSurplusCallCount(), 0, "strategy2 skimSurplus never called");
 
         // Payment should equal only the non-exempt yield (with discount)
         uint256 expectedPayment = yield1 * 98 / 100;
@@ -2056,14 +2029,13 @@ contract StableYieldAccumulatorTest is Test {
         // Setup
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200);
         accumulator.setNFTMinter(address(mockNFTMinter));
 
         // Healthy strategy
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
-        // Broken strategy — always reverts on withdrawFrom
+        // Broken strategy — always reverts on skimSurplus
         MockRevertingYieldStrategy broken = new MockRevertingYieldStrategy();
         accumulator.addYieldStrategy(address(broken), address(strategyToken2));
 
@@ -2104,7 +2076,7 @@ contract StableYieldAccumulatorTest is Test {
             healthyYield,
             "Claimer should receive healthy strategy's yield"
         );
-        assertEq(broken.withdrawFromCallCount(), 0, "Broken strategy's withdrawFrom must never run");
+        assertEq(broken.skimSurplusCallCount(), 0, "Broken strategy's skimSurplus must never run");
 
         uint256 expectedPayment = healthyYield * 98 / 100;
         assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo received only healthy share");
@@ -2210,7 +2182,6 @@ contract NFTClaimGateTest is Test {
         // Setup basic claim infrastructure
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
         accumulator.setDiscountRate(200); // 2% discount
         accumulator.setNFTMinter(address(mockNFTMinter));
 
@@ -2321,7 +2292,6 @@ contract NFTClaimGateTest is Test {
         // Setup without setting NFT minter
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
-        accumulator.setMinter(minterAddr);
 
         // Do NOT set NFT minter
         // accumulator.setNFTMinter(...)
