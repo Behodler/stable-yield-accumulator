@@ -57,67 +57,21 @@ The discount incentivizes external actors to pay gas costs for the conversion.
 
 ## Dependency Management
 
-### Types of Dependencies
+Dependencies are managed as regular git submodules under `lib/` (see `.gitmodules`):
 
-1. **Immutable Dependencies** (lib/immutable/)
-   - External libraries and contracts that don't change based on sibling requirements
-   - Full source code is available
-   - Examples: OpenZeppelin, standard libraries
-
-2. **Mutable Dependencies** (lib/mutable/)
-   - Dependencies from sibling submodules
-   - ONLY interfaces and abstract contracts are exposed
-   - NO implementation details are available
-   - Changes to these dependencies must go through the change request process
-
-### Important Rules
-
-- **NEVER** access implementation details of mutable dependencies
-- Mutable dependencies only expose interfaces and abstract contracts
-- If a feature requires changes to a mutable dependency, add it to the change request queue
-- All development must follow Test-Driven Development (TDD) principles using Foundry
-
-### Change Request Process
-
-When a feature requires changes to a mutable dependency:
-
-1. Add the request to `MutableChangeRequests.json` with format:
-   ```json
-   {
-     "requests": [
-       {
-         "dependency": "dependency-name",
-         "changes": [
-           {
-             "fileName": "ISomeInterface.sol",
-             "description": "Plain language description of what needs to change"
-           }
-         ]
-       }
-     ]
-   }
-   ```
-
-2. **STOP WORK** immediately after adding the change request
-3. Inform the user that dependency changes are needed
-4. Wait for the dependency to be updated before continuing
-
-### Available Commands
-
-Use these as slash commands (e.g., `/add-mutable-dependency`) or run the scripts directly:
-
-- `.claude/scripts/add-mutable-dependency.sh <repo>` - Add a mutable dependency (sibling)
-- `.claude/scripts/add-immutable-dependency.sh <repo>` - Add an immutable dependency
-- `.claude/scripts/update-mutable-dependency.sh <name>` - Update a mutable dependency
-- `.claude/scripts/consider-change-requests.sh` - Review and implement sibling change requests
+- External libraries (`openzeppelin-contracts`, `forge-std`) and sibling
+  contracts (`vault`, `pauser`, `phlimbo-ea`, `yield-claim-nft`) are all plain
+  submodules with full source available.
+- Update with `git submodule update --remote <path>`; add with
+  `git submodule add <url> lib/<name>`.
+- Import paths are wired through `remappings.txt`.
 
 ## Project Structure
 
 - `src/` - Solidity source files
 - `test/` - Test files (TDD required)
 - `script/` - Deployment scripts
-- `lib/mutable/` - Mutable dependencies (interfaces only)
-- `lib/immutable/` - Immutable dependencies (full source)
+- `lib/` - Dependencies as git submodules (vault, pauser, phlimbo-ea, yield-claim-nft, openzeppelin-contracts, forge-std)
 
 ## Development Guidelines
 
@@ -170,7 +124,6 @@ Step 5 queries `sya.rewardToken()` to determine which token to skip, rather than
 
 ## Important Reminders
 
-- This submodule operates independently from sibling submodules
+- Dependencies are consumed as regular git submodules in `lib/`
 - Follow Solidity best practices and naming conventions
 - Use Foundry testing tools exclusively (no Hardhat or Truffle)
-- If you need to change a mutable dependency, use the change request process
