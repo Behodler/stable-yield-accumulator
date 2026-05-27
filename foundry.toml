@@ -4,10 +4,10 @@ out = "out"
 libs = ["lib"]
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
-    "pauser/=lib/mutable/pauser/src/",
-    "vault/=lib/mutable/vault/src/",
-    "phlimbo-ea/=lib/mutable/phlimbo-ea/src/",
-    "yield-claim-nft/=lib/mutable/yield-claim-nft/src/"
+    "pauser/=lib/pauser/src/",
+    "vault/=lib/vault/src/",
+    "phlimbo-ea/=lib/phlimbo-ea/src/",
+    "yield-claim-nft/=lib/yield-claim-nft/src/"
 ]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
