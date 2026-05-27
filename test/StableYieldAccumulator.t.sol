@@ -165,6 +165,10 @@ contract MockYieldStrategy is IYieldStrategy {
     function setClient(address, bool) external pure override {}
     function emergencyWithdraw(uint256) external pure override {}
     function totalWithdrawal(address, address) external pure override {}
+    function setSetAsideBuffer(address, uint256) external pure override {}
+    function setAsideBufferSize(address) external pure override returns (uint256) {
+        return 0;
+    }
 
     /**
      * @notice Mock skimSurplus that batch-withdraws the surplus of all authorized clients.
@@ -247,6 +251,10 @@ contract MockRevertingYieldStrategy is IYieldStrategy {
     function setClient(address, bool) external pure override {}
     function emergencyWithdraw(uint256) external pure override {}
     function totalWithdrawal(address, address) external pure override {}
+    function setSetAsideBuffer(address, uint256) external pure override {}
+    function setAsideBufferSize(address) external pure override returns (uint256) {
+        return 0;
+    }
 
     /// @notice Always reverts — simulates a broken adapter (audit M-04 PoC pattern)
     function skimSurplus(address, address) external override returns (uint256) {
