@@ -5,10 +5,6 @@
 	path = lib/pauser
 	url = git@github.com:Behodler/pauser.git
 	branch = master
-[submodule "lib/phlimbo-ea"]
-	path = lib/phlimbo-ea
-	url = git@github.com:Behodler/phlimbo-ea.git
-	branch = master
 [submodule "lib/vault"]
 	path = lib/vault
 	url = git@github.com:Behodler/reflax-yield-vault.git
@@ -17,3 +13,6 @@
 	path = lib/yield-claim-nft
 	url = git@github.com:Behodler/yield-claim-nft.git
 	branch = master
+[submodule "lib/phlimbo-ea"]
+	path = lib/phlimbo-ea
+	url = ../phlimbo-ea
