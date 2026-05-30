@@ -15,4 +15,5 @@
 	branch = master
 [submodule "lib/phlimbo-ea"]
 	path = lib/phlimbo-ea
-	url = ../phlimbo-ea
+	url = git@github.com:Behodler/phlimbo-ea.git
+	branch = master
