@@ -11,7 +11,7 @@ import "pauser/interfaces/IPausable.sol";
 import "./interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
 import "phlimbo-ea/interfaces/IPhlimbo.sol";
-import "yield-claim-nft/interfaces/INFTMinter.sol";
+import "yield-claim-nft/interfaces/INFTMinterV2.sol";
 
 /**
  * @title StableYieldAccumulator
@@ -407,7 +407,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Sets the NFTMinter contract address for claim gating
-     * @dev The NFTMinter must be an ERC1155 contract that also implements INFTMinter.
+     * @dev The NFTMinter must be an ERC1155 contract that also implements INFTMinterV2.
      *      The StableYieldAccumulator must be registered as an authorized burner on the NFTMinter.
      * @param _nftMinter Address of the NFTMinter contract
      */
@@ -533,7 +533,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         require(index > 0, "Invalid index");
 
         if (IERC1155(nftMinter).balanceOf(caller, index) > 0) {
-            INFTMinter(nftMinter).burn(caller, index, 1);
+            INFTMinterV2(nftMinter).burn(caller, index, 1);
         } else {
             revert NoValidNFT();
         }
@@ -702,7 +702,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             return false;
         }
 
-        uint256 count = INFTMinter(nftMinter).nextIndex();
+        uint256 count = INFTMinterV2(nftMinter).nextIndex();
         for (uint256 i = 1; i < count; i++) {
             if (IERC1155(nftMinter).balanceOf(caller, i) > 0) {
                 return true;
