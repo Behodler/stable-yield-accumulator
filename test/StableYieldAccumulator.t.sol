@@ -8,6 +8,8 @@ import "vault/interfaces/IYieldStrategy.sol";
 import "phlimbo-ea/interfaces/IPhlimbo.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import {INudgeStreamer} from "phoenix-nft-staking/INudgeStreamer.sol";
+import {NudgeStreamer} from "phoenix-nft-staking/NudgeStreamer.sol";
 
 /**
  * @title MockERC20
@@ -166,6 +168,7 @@ contract MockYieldStrategy is IYieldStrategy {
     function emergencyWithdraw(uint256) external pure override {}
     function totalWithdrawal(address, address) external pure override {}
     function setSetAsideBuffer(address, uint256) external pure override {}
+
     function setAsideBufferSize(address) external pure override returns (uint256) {
         return 0;
     }
@@ -252,6 +255,7 @@ contract MockRevertingYieldStrategy is IYieldStrategy {
     function emergencyWithdraw(uint256) external pure override {}
     function totalWithdrawal(address, address) external pure override {}
     function setSetAsideBuffer(address, uint256) external pure override {}
+
     function setAsideBufferSize(address) external pure override returns (uint256) {
         return 0;
     }
@@ -355,6 +359,32 @@ contract MockNFTMinter {
 }
 
 /**
+ * @title MockNudgeBatchMinter
+ * @notice Minimal stand-in for `BatchNFTMinterMultiToken`, covering only the surface a
+ *         `NudgeStreamer` needs from a nudge sink.
+ * @dev Adapted from `yield-claim-nft/test/mocks/MockNudgeBatchMinter.sol`.
+ *
+ *      * `isNudgeToken(address)` — `NudgeStreamer.registerStream` calls this on the target both
+ *        to check the token is whitelisted AND (structurally) to reject non-MultiToken targets.
+ *        A plain EOA sink like `makeAddr("nudgeRecipient")` can therefore never be registered,
+ *        which is why the accumulator's nudge sink must be a contract in these tests.
+ *      * `flush` mirrors `BatchNFTMinterMultiToken`'s step-3.5 pull: the batch-minter is the
+ *        `msg.sender` the streamer settles to.
+ */
+contract MockNudgeBatchMinter {
+    mapping(address => bool) public isNudgeToken;
+
+    function setNudgeToken(address token, bool allowed) external {
+        isNudgeToken[token] = allowed;
+    }
+
+    /// @dev Mirrors `BatchNFTMinterMultiToken`'s step-3.5 flush.
+    function flush(address streamer, address token) external {
+        INudgeStreamer(streamer).pullPendingStream(token);
+    }
+}
+
+/**
  * @title StableYieldAccumulatorTest
  * @notice Comprehensive test suite for StableYieldAccumulator
  * @dev GREEN PHASE - Tests verify actual behavior with real token transfers
@@ -368,6 +398,15 @@ contract StableYieldAccumulatorTest is Test {
     MockYieldStrategy public mockStrategy2;
     MockPhlimbo public mockPhlimbo;
     MockNFTMinter public mockNFTMinter;
+
+    /// @notice Real NudgeStreamer (not a mock) — the nudge share is routed through it.
+    NudgeStreamer public streamer;
+
+    /// @notice Contract-shaped nudge sink; an EOA can never be registered on the streamer.
+    MockNudgeBatchMinter public batchMinterMock;
+
+    /// @notice Streaming window registered for (batchMinterMock, rewardToken).
+    uint256 public constant STREAM_DURATION = 7 days;
 
     address public owner;
     address public pauser;
@@ -392,6 +431,16 @@ contract StableYieldAccumulatorTest is Test {
     event RewardsCollected(address indexed strategy, uint256 amount);
     event NudgeUpdated(address indexed oldNudge, address indexed newNudge);
     event NudgeSplitUpdated(uint256 oldSplit, uint256 newSplit);
+    event NudgeStreamerUpdated(address indexed oldStreamer, address indexed newStreamer);
+
+    // Mirrors NudgeStreamer.NudgeCollected so it can be matched with vm.expectEmit.
+    event NudgeCollected(
+        address indexed batchMinter,
+        address indexed token,
+        address indexed donor,
+        uint256 amount,
+        uint256 rewardPerSecond
+    );
 
     function setUp() public {
         owner = address(this);
@@ -423,6 +472,26 @@ contract StableYieldAccumulatorTest is Test {
         mockNFTMinter.setAuthorizedBurner(address(accumulator), true);
         // Register a dispatcher so there's a valid token ID
         mockNFTMinter.registerDispatcher(makeAddr("dispatcher1"), 1e18, 100);
+
+        // Nudge streaming rail. Ops order matters and is enforced by NudgeStreamer:
+        //   1. the sink whitelists the token (registerStream calls isNudgeToken on it)
+        //   2. the streamer owner registers the (sink, token) stream
+        // The accumulator-side wiring (setNudgeAddress + setNudgeStreamer) is deliberately NOT
+        // done here: several tests assert the untouched default state, and the split-0 test
+        // proves a claim still works with no streamer configured. Use _wireNudgeStreamer().
+        batchMinterMock = new MockNudgeBatchMinter();
+        batchMinterMock.setNudgeToken(address(rewardToken), true);
+        streamer = new NudgeStreamer(owner);
+        streamer.registerStream(address(batchMinterMock), address(rewardToken), STREAM_DURATION);
+    }
+
+    /**
+     * @notice Points the accumulator at the contract sink and the streamer, in ops order.
+     * @dev Step 3 of the documented ops sequence (steps 1 and 2 happen in setUp).
+     */
+    function _wireNudgeStreamer() internal {
+        accumulator.setNudgeAddress(address(batchMinterMock));
+        accumulator.setNudgeStreamer(address(streamer));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1770,40 +1839,38 @@ contract StableYieldAccumulatorTest is Test {
         // Regression: with default state, claim() routes everything to phlimbo
         uint256 yieldAmount = 100e18;
         address claimer = _setupClaimScenario(yieldAmount);
-        address nudgeAddr = makeAddr("nudgeRecipient");
 
         // Note: nudge address is intentionally NOT set; nudgeSplit is also default (0)
         uint256 expectedPayment = yieldAmount * 98 / 100;
-        uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
 
         vm.prank(claimer);
         accumulator.claim(1, 0, new address[](0));
 
         assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive full payment");
         assertEq(mockPhlimbo.collectRewardCallCount(), 1, "Phlimbo should be called once");
-        assertEq(rewardToken.balanceOf(nudgeAddr), nudgeBalanceBefore, "Nudge should receive nothing");
+        assertEq(rewardToken.balanceOf(address(streamer)), 0, "Streamer should receive nothing");
+        assertEq(rewardToken.balanceOf(address(batchMinterMock)), 0, "Sink should receive nothing");
     }
 
     function test_claim_SplitThirty_PartialNudgeAndPhlimbo() public {
         uint256 yieldAmount = 100e18;
         address claimer = _setupClaimScenario(yieldAmount);
-        address nudgeAddr = makeAddr("nudgeRecipient");
 
-        accumulator.setNudgeAddress(nudgeAddr);
+        _wireNudgeStreamer();
         accumulator.setNudgeSplit(30);
 
         uint256 expectedPayment = yieldAmount * 98 / 100; // 98e18
         uint256 expectedNudge = expectedPayment * 30 / 100; // 29.4e18
         uint256 expectedPhlimbo = expectedPayment - expectedNudge; // 68.6e18
 
-        uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
-
         vm.prank(claimer);
         accumulator.claim(1, 0, new address[](0));
 
-        assertEq(
-            rewardToken.balanceOf(nudgeAddr) - nudgeBalanceBefore, expectedNudge, "Nudge should receive 30% of payment"
-        );
+        assertEq(rewardToken.balanceOf(address(streamer)), expectedNudge, "streamer should hold the nudge share");
+        assertEq(rewardToken.balanceOf(address(batchMinterMock)), 0, "sink receives it only as it streams");
+        (, uint256 buffer,,) = streamer.streams(address(batchMinterMock), address(rewardToken));
+        assertEq(buffer, expectedNudge, "stream buffer should equal the donation");
+        assertEq(rewardToken.allowance(address(accumulator), address(streamer)), 0, "no residual allowance lingers");
         assertEq(mockPhlimbo.lastCollectedAmount(), expectedPhlimbo, "Phlimbo should receive remainder");
         assertEq(mockPhlimbo.collectRewardCallCount(), 1, "Phlimbo should still be called");
     }
@@ -1811,20 +1878,20 @@ contract StableYieldAccumulatorTest is Test {
     function test_claim_SplitHundred_FullToNudge_PhlimboNotCalled() public {
         uint256 yieldAmount = 100e18;
         address claimer = _setupClaimScenario(yieldAmount);
-        address nudgeAddr = makeAddr("nudgeRecipient");
 
-        accumulator.setNudgeAddress(nudgeAddr);
+        _wireNudgeStreamer();
         accumulator.setNudgeSplit(100);
 
         uint256 expectedPayment = yieldAmount * 98 / 100; // 98e18
-        uint256 nudgeBalanceBefore = rewardToken.balanceOf(nudgeAddr);
 
         vm.prank(claimer);
         accumulator.claim(1, 0, new address[](0));
 
-        assertEq(
-            rewardToken.balanceOf(nudgeAddr) - nudgeBalanceBefore, expectedPayment, "Nudge should receive full payment"
-        );
+        assertEq(rewardToken.balanceOf(address(streamer)), expectedPayment, "streamer should hold the nudge share");
+        assertEq(rewardToken.balanceOf(address(batchMinterMock)), 0, "sink receives it only as it streams");
+        (, uint256 buffer,,) = streamer.streams(address(batchMinterMock), address(rewardToken));
+        assertEq(buffer, expectedPayment, "stream buffer should equal the donation");
+        assertEq(rewardToken.allowance(address(accumulator), address(streamer)), 0, "no residual allowance lingers");
         assertEq(mockPhlimbo.collectRewardCallCount(), 0, "Phlimbo should NOT be called when split is 100");
     }
 
@@ -1844,7 +1911,6 @@ contract StableYieldAccumulatorTest is Test {
         // Setup scenario where actualPayment is small enough for rounding to matter.
         // Use no discount and identity normalization so the actualPayment equals the yield exactly.
         address claimer = makeAddr("claimer");
-        address nudgeAddr = makeAddr("nudgeRecipient");
 
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
@@ -1868,8 +1934,8 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.approvePhlimbo(type(uint256).max);
         mockNFTMinter.mintNFT(claimer, 1, 1);
 
-        // Configure nudge with 33% split
-        accumulator.setNudgeAddress(nudgeAddr);
+        // Configure nudge with 33% split, routed through the streamer
+        _wireNudgeStreamer();
         accumulator.setNudgeSplit(33);
 
         // Expected: nudgeAmount = 7 * 33 / 100 = 2 (integer division)
@@ -1877,23 +1943,172 @@ contract StableYieldAccumulatorTest is Test {
         uint256 expectedNudge = 2;
         uint256 expectedPhlimbo = 5;
 
-        uint256 nudgeBalBefore = rewardToken.balanceOf(nudgeAddr);
+        uint256 streamerBalBefore = rewardToken.balanceOf(address(streamer));
         uint256 accumulatorBalBefore = rewardToken.balanceOf(address(accumulator));
 
         vm.prank(claimer);
         accumulator.claim(1, 0, new address[](0));
 
-        uint256 nudgeReceived = rewardToken.balanceOf(nudgeAddr) - nudgeBalBefore;
+        uint256 nudgeReceived = rewardToken.balanceOf(address(streamer)) - streamerBalBefore;
         uint256 phlimboReceived = mockPhlimbo.lastCollectedAmount();
 
-        assertEq(nudgeReceived, expectedNudge, "Nudge should receive 2 (floor(7*33/100))");
+        assertEq(nudgeReceived, expectedNudge, "Streamer should receive 2 (floor(7*33/100))");
         assertEq(phlimboReceived, expectedPhlimbo, "Phlimbo should receive 5 via subtraction");
         assertEq(nudgeReceived + phlimboReceived, 7, "Sum must equal full actualPayment - no precision loss");
+        (, uint256 buffer,,) = streamer.streams(address(batchMinterMock), address(rewardToken));
+        assertEq(buffer, expectedNudge, "stream buffer should equal the donation");
+        assertEq(rewardToken.balanceOf(address(batchMinterMock)), 0, "sink receives it only as it streams");
+        assertEq(rewardToken.allowance(address(accumulator), address(streamer)), 0, "no residual allowance lingers");
         // Accumulator should not retain any dust
         assertEq(
             rewardToken.balanceOf(address(accumulator)),
             accumulatorBalBefore,
             "Accumulator should hold no residual dust"
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    NUDGE STREAMER CONFIGURATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_nudgeStreamer_DefaultsToZeroAddress() public {
+        assertEq(accumulator.nudgeStreamer(), address(0), "Initial nudgeStreamer should be zero address");
+    }
+
+    function test_setNudgeStreamer_StoresAndEmits() public {
+        vm.expectEmit(true, true, false, true);
+        emit NudgeStreamerUpdated(address(0), address(streamer));
+        accumulator.setNudgeStreamer(address(streamer));
+
+        assertEq(accumulator.nudgeStreamer(), address(streamer), "Streamer address should be stored");
+
+        // Update to new value, emits old + new
+        address newStreamer = address(new NudgeStreamer(owner));
+        vm.expectEmit(true, true, false, true);
+        emit NudgeStreamerUpdated(address(streamer), newStreamer);
+        accumulator.setNudgeStreamer(newStreamer);
+        assertEq(accumulator.nudgeStreamer(), newStreamer, "Streamer address should update");
+    }
+
+    function test_setNudgeStreamer_RevertIf_NotOwner() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        accumulator.setNudgeStreamer(address(streamer));
+    }
+
+    function test_setNudgeStreamer_RevertIf_ZeroAddress() public {
+        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
+        accumulator.setNudgeStreamer(address(0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    NUDGE STREAMER CLAIM ROUTING TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_claim_RevertIf_NudgeStreamerUnset() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        // Sink is set but the streamer never was
+        accumulator.setNudgeAddress(address(batchMinterMock));
+        accumulator.setNudgeSplit(30);
+
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.NudgeStreamerNotConfigured.selector);
+        accumulator.claim(1, 0, new address[](0));
+    }
+
+    function test_claim_SplitZero_RequiresNoStreamer() public {
+        // The mandatory-streamer requirement is scoped to the live-donation branch: a split-0
+        // accumulator must still claim with nudgeStreamer == address(0).
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        assertEq(accumulator.nudgeStreamer(), address(0), "Precondition: no streamer configured");
+        assertEq(accumulator.nudgeSplit(), 0, "Precondition: split is 0");
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0, new address[](0));
+
+        uint256 expectedPayment = yieldAmount * 98 / 100;
+        assertEq(mockPhlimbo.lastCollectedAmount(), expectedPayment, "Phlimbo should receive full payment");
+        assertEq(strategyToken1.balanceOf(claimer), yieldAmount, "Claimer should have received yield tokens");
+    }
+
+    function test_claim_RevertIf_StreamNotRegistered() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        // A whitelisted-but-never-registered sink: ops skipped registerStream for this pair.
+        MockNudgeBatchMinter unregisteredSink = new MockNudgeBatchMinter();
+        unregisteredSink.setNudgeToken(address(rewardToken), true);
+
+        accumulator.setNudgeAddress(address(unregisteredSink));
+        accumulator.setNudgeStreamer(address(streamer));
+        accumulator.setNudgeSplit(30);
+
+        vm.prank(claimer);
+        vm.expectRevert(NudgeStreamer.NudgeStreamer__NotRegistered.selector);
+        accumulator.claim(1, 0, new address[](0));
+    }
+
+    function test_claim_EmitsNudgeCollectedWithAccumulatorAsDonor() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        _wireNudgeStreamer();
+        accumulator.setNudgeSplit(30);
+
+        uint256 expectedPayment = yieldAmount * 98 / 100;
+        uint256 expectedNudge = expectedPayment * 30 / 100;
+        uint256 expectedRate = (expectedNudge * 1e18) / STREAM_DURATION;
+
+        vm.expectEmit(true, true, true, true, address(streamer));
+        emit NudgeCollected(
+            address(batchMinterMock), address(rewardToken), address(accumulator), expectedNudge, expectedRate
+        );
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0, new address[](0));
+    }
+
+    function test_claim_DonationStreamsLinearlyToSink() public {
+        uint256 yieldAmount = 100e18;
+        address claimer = _setupClaimScenario(yieldAmount);
+
+        _wireNudgeStreamer();
+        accumulator.setNudgeSplit(30);
+
+        uint256 expectedPayment = yieldAmount * 98 / 100;
+        uint256 expectedNudge = expectedPayment * 30 / 100;
+
+        vm.prank(claimer);
+        accumulator.claim(1, 0, new address[](0));
+
+        assertEq(rewardToken.balanceOf(address(batchMinterMock)), 0, "Nothing has streamed yet");
+
+        // Half the window elapses: half the donation is claimable by the sink.
+        vm.warp(block.timestamp + STREAM_DURATION / 2);
+        assertApproxEqAbs(
+            streamer.pendingStream(address(batchMinterMock), address(rewardToken)),
+            expectedNudge / 2,
+            1,
+            "Half the donation should have accrued"
+        );
+
+        // The batch-minter flushes it the way batchMint step 3.5 does.
+        batchMinterMock.flush(address(streamer), address(rewardToken));
+        assertApproxEqAbs(
+            rewardToken.balanceOf(address(batchMinterMock)),
+            expectedNudge / 2,
+            1,
+            "Sink should have received the streamed half"
+        );
+        assertApproxEqAbs(
+            rewardToken.balanceOf(address(streamer)),
+            expectedNudge - expectedNudge / 2,
+            1,
+            "Streamer should retain the unstreamed remainder"
         );
     }
 
