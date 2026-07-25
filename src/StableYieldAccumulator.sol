@@ -12,6 +12,7 @@ import "./interfaces/IStableYieldAccumulator.sol";
 import "vault/interfaces/IYieldStrategy.sol";
 import "phlimbo-ea/interfaces/IPhlimbo.sol";
 import "yield-claim-nft/interfaces/INFTMinterV2.sol";
+import {INudgeStreamer} from "phoenix-nft-staking/INudgeStreamer.sol";
 
 /**
  * @title StableYieldAccumulator
@@ -53,6 +54,51 @@ import "yield-claim-nft/interfaces/INFTMinterV2.sol";
  * 3. **No Oracles/AMMs** - Uses assumed 1:1 exchange rates for stablecoins (owner can adjust for permanent depegs)
  * 4. **Claim Mechanism** - External users swap their reward token holdings for pending yield strategy rewards
  * 5. **NFT Gate** - Claims require holding a valid NFT from the NFTMinter contract; exactly 1 NFT is burned per claim
+ *
+ * ## Nudge share routing (story 026)
+ *
+ * The nudge share of every claim is no longer pushed with a direct `safeTransfer(nudge, amount)`.
+ * That leg has been REMOVED, not kept as a fallback. It is now approved to a `NudgeStreamer` and
+ * PULLED by `collectNudge(nudge, rewardToken, nudgeAmount)`, so the batch-minter (`nudge`) receives
+ * a smooth linear stream instead of a lumpy push. `nudge` remains the SINK; `nudgeStreamer` is a
+ * separate address.
+ *
+ * ### The streamer is mandatory ON THE LIVE-DONATION BRANCH ONLY
+ *
+ * The requirement lives inside `if (nudgeAmount > 0)`, so an accumulator with `nudgeSplit == 0`
+ * stays fully claimable with no streamer set. Once a nudge share is actually payable there are
+ * three failure modes, all deliberate and loud (there is no try/catch envelope here):
+ *
+ * 1. `nudgeStreamer == address(0)` — its post-deploy state, since it is a setter-only field
+ *    (deliberately not a constructor argument, because the streamer is deployed later) — makes
+ *    `claim` revert `NudgeStreamerNotConfigured`.
+ * 2. If the streamer is set but ops forgot `registerStream(nudge, rewardToken, duration)` on it,
+ *    every `claim` reverts `NudgeStreamer__NotRegistered()`. That is the accepted consequence of
+ *    the mandatory-streamer decision, not an audit finding.
+ * 3. Repointing the sink via `setNudgeAddress` re-arms exactly that failure mode: register the new
+ *    `(sink, rewardToken)` pair on the streamer FIRST.
+ *
+ * ### Required ops ordering
+ *
+ * (Reversing the first two additionally reverts `NudgeStreamer__NotWhitelisted`.)
+ *
+ * 1. `nudge.setNudgeTokenWhitelist(rewardToken, true)` on the batch-minter
+ * 2. `nudgeStreamer.registerStream(nudge, rewardToken, duration)`
+ * 3. `this.setNudgeAddress(nudge)` and `this.setNudgeStreamer(nudgeStreamer)`
+ * 4. `nudge.setNudgeStreamer(nudgeStreamer)` so `batchMint` step 3.5 flushes the accrued stream
+ *
+ * The `nudge` sink must therefore be a `BatchNFTMinterMultiToken`-shaped contract: `registerStream`
+ * calls `isNudgeToken` on it, so an EOA can never be a nudge sink.
+ *
+ * ### Gas / behaviour
+ *
+ * The donation is no longer a leaf `transfer`. `collectNudge` first settles the accrued stream (an
+ * outbound transfer to the sink) and then pulls via `transferFrom`, all inside the claim
+ * transaction, so `claim` is measurably more expensive and now depends on external streamer state.
+ * `collectNudge` also reverts `NudgeStreamer__ZeroAmount()` on a zero amount, which is why the
+ * `nudgeAmount > 0` guard is load-bearing rather than cosmetic. The allowance is granted inline
+ * with the exact amount via `forceApprove` and fully consumed in the same transaction, so no
+ * standing approval is ever outstanding.
  */
 contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable, IStableYieldAccumulator {
     using SafeERC20 for IERC20;
@@ -100,16 +146,27 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     address public phlimbo;
 
     /**
-     * @notice Auxiliary recipient that receives a configurable share of each claim payment
-     * @dev Defaults to address(0); when nudgeSplit > 0, must be set or claim() reverts
+     * @notice Auxiliary SINK that receives a configurable share of each claim payment
+     * @dev Defaults to address(0); when nudgeSplit > 0, must be set or claim() reverts.
+     *      Must be a BatchNFTMinterMultiToken-shaped contract, never an EOA: the streamer's
+     *      registerStream calls isNudgeToken on it. Funds reach it via the NudgeStreamer's
+     *      linear stream, not by a direct transfer from this contract.
      */
     address public nudge;
 
     /**
-     * @notice Percentage of each claim payment routed to the nudge address
+     * @notice Percentage of each claim payment routed to the nudge sink via the NudgeStreamer
      * @dev Inclusive range [0, 100]. Defaults to 0 (no diversion to nudge).
      */
     uint256 public nudgeSplit;
+
+    /**
+     * @notice NudgeStreamer that buffers the nudge share and streams it linearly to `nudge`
+     * @dev Defaults to address(0) and is a setter-only field, because the streamer is deployed
+     *      after this contract. Mandatory only on the live-donation branch: a claim whose
+     *      nudgeAmount resolves to 0 never touches it. See the contract-level ops ordering.
+     */
+    address public nudgeStreamer;
 
     /**
      * @notice Mapping to check if a strategy is registered (O(1) lookup)
@@ -389,8 +446,9 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     }
 
     /**
-     * @notice Sets the percentage of each claim payment routed to the nudge address
-     * @dev Must be in the inclusive range [0, 100]. A value of 0 disables routing to nudge.
+     * @notice Sets the percentage of each claim payment routed to the nudge sink via the streamer
+     * @dev Must be in the inclusive range [0, 100]. A value of 0 disables routing to nudge, and
+     *      also removes the need for a configured nudgeStreamer.
      * @param _split Percentage in the inclusive range [0, 100]
      */
     function setNudgeSplit(uint256 _split) external onlyOwner {
@@ -399,6 +457,22 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         uint256 oldSplit = nudgeSplit;
         nudgeSplit = _split;
         emit NudgeSplitUpdated(oldSplit, _split);
+    }
+
+    /**
+     * @notice Sets the NudgeStreamer through which the nudge share is routed
+     * @dev Rejects address(0): clearing it would silently disarm the donation rail rather than
+     *      failing loudly, and the only supported way to stop donating is setNudgeSplit(0).
+     *      The streamer owner must have registered the (nudge, rewardToken) stream first —
+     *      see the contract-level ops ordering.
+     * @param _streamer Address of the NudgeStreamer contract
+     */
+    function setNudgeStreamer(address _streamer) external onlyOwner {
+        if (_streamer == address(0)) revert ZeroAddress();
+
+        address oldStreamer = nudgeStreamer;
+        nudgeStreamer = _streamer;
+        emit NudgeStreamerUpdated(oldStreamer, _streamer);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -512,8 +586,17 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
         uint256 nudgeAmount = (actualPayment * nudgeSplit) / 100;
         uint256 phlimboAmount = actualPayment - nudgeAmount;
 
+        // The nudge share is PULLED by the streamer, not pushed to the sink. The `> 0` guard is
+        // load-bearing: collectNudge reverts NudgeStreamer__ZeroAmount() on a zero amount. The
+        // streamer requirement is scoped to this branch so a split-0 accumulator still claims
+        // with no streamer set. forceApprove (not approve) with the exact amount, because the
+        // reward token may be USDT-shaped; collectNudge consumes the whole allowance in this same
+        // transaction, so nothing lingers and no infinite approval is handed out.
         if (nudgeAmount > 0) {
-            IERC20(rewardToken).safeTransfer(nudge, nudgeAmount);
+            address streamer = nudgeStreamer;
+            if (streamer == address(0)) revert NudgeStreamerNotConfigured();
+            IERC20(rewardToken).forceApprove(streamer, nudgeAmount);
+            INudgeStreamer(streamer).collectNudge(nudge, rewardToken, nudgeAmount);
         }
         if (phlimboAmount > 0) {
             IPhlimbo(phlimbo).collectReward(phlimboAmount);

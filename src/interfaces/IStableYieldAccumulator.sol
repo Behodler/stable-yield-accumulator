@@ -88,6 +88,13 @@ interface IStableYieldAccumulator {
     event NudgeSplitUpdated(uint256 oldSplit, uint256 newSplit);
 
     /**
+     * @notice Emitted when the nudge streamer address is updated
+     * @param oldStreamer Previous NudgeStreamer address (may be address(0) while unset)
+     * @param newStreamer New NudgeStreamer address (never address(0))
+     */
+    event NudgeStreamerUpdated(address indexed oldStreamer, address indexed newStreamer);
+
+    /**
      * @notice Emitted when a user claims rewards
      * @param claimer Address that performed the claim
      * @param amountPaid Amount of reward token paid
@@ -173,6 +180,13 @@ interface IStableYieldAccumulator {
      * @notice Thrown during claim when nudgeSplit > 0 but the nudge address has not been set
      */
     error NudgeNotConfigured();
+
+    /**
+     * @notice Thrown during claim when a nudge share is actually payable but no NudgeStreamer is set
+     * @dev Scoped to the live-donation branch: a nudgeSplit of 0 never reaches this check, so a
+     *      split-0 accumulator remains fully claimable with nudgeStreamer == address(0).
+     */
+    error NudgeStreamerNotConfigured();
 
     /*//////////////////////////////////////////////////////////////
                         YIELD STRATEGY MANAGEMENT
@@ -280,13 +294,25 @@ interface IStableYieldAccumulator {
     function setNudgeAddress(address _nudge) external;
 
     /**
-     * @notice Sets the percentage of each claim payment routed to the nudge address
+     * @notice Sets the percentage of each claim payment routed to the nudge sink via the NudgeStreamer
      * @dev Must be in the inclusive range [0, 100]. Reverts with InvalidNudgeSplit otherwise.
-     *      A value of 0 (the default) preserves pre-existing behavior (full payment to phlimbo).
-     *      A value of 100 routes the full payment to the nudge address and skips the phlimbo collectReward call.
+     *      A value of 0 (the default) preserves pre-existing behavior (full payment to phlimbo) and
+     *      requires no NudgeStreamer to be configured.
+     *      A value of 100 routes the full payment to the NudgeStreamer (which then streams it to the
+     *      nudge sink) and skips the phlimbo collectReward call.
      * @param _split Percentage in the inclusive range [0, 100]
      */
     function setNudgeSplit(uint256 _split) external;
+
+    /**
+     * @notice Sets the NudgeStreamer that buffers and streams the nudge share to the nudge sink
+     * @dev Owner-only; rejects address(0) with ZeroAddress. It is a setter rather than a constructor
+     *      argument because the streamer is deployed after the accumulator. The streamer owner must
+     *      have called registerStream(nudge, rewardToken, duration) or every claim with a payable
+     *      nudge share reverts NudgeStreamer__NotRegistered.
+     * @param _streamer Address of the NudgeStreamer contract
+     */
+    function setNudgeStreamer(address _streamer) external;
 
     /**
      * @notice Gets the current nudge recipient address
@@ -299,6 +325,12 @@ interface IStableYieldAccumulator {
      * @return Split percentage in the inclusive range [0, 100]
      */
     function nudgeSplit() external view returns (uint256);
+
+    /**
+     * @notice Gets the current NudgeStreamer address
+     * @return Address of the NudgeStreamer (address(0) if unset)
+     */
+    function nudgeStreamer() external view returns (address);
 
     /*//////////////////////////////////////////////////////////////
                             CLAIM MECHANISM
