@@ -17,3 +17,7 @@
 	path = lib/phlimbo-ea
 	url = git@github.com:Behodler/phlimbo-ea.git
 	branch = master
+[submodule "lib/phoenix-nft-staking"]
+	path = lib/phoenix-nft-staking
+	url = git@github.com:Behodler/phoenix-nft-staking.git
+	branch = master
