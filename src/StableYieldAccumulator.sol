@@ -15,6 +15,26 @@ import "yield-claim-nft/interfaces/INFTMinterV2.sol";
 import {INudgeStreamer} from "phoenix-nft-staking/INudgeStreamer.sol";
 
 /**
+ * @title INudgeStreamerStreams
+ * @notice Minimal view over NudgeStreamer's public `streams` mapping getter, which
+ *         `INudgeStreamer` does not expose.
+ * @dev Declared locally rather than upstream because `phoenix-nft-staking` is a pinned submodule
+ *      owned by a separate project. Tuple order must match `NudgeStreamer.Stream`
+ *      (duration, buffer, rewardPerSecond, lastUpdate); drift is caught immediately by the test
+ *      suite, which exercises the real `NudgeStreamer` rather than a mock.
+ *
+ *      `duration == 0` is the streamer's own canonical "unregistered" sentinel.
+ *      `pendingStream` is not a usable probe: it returns 0 for both "registered but empty" and
+ *      "unregistered".
+ */
+interface INudgeStreamerStreams {
+    function streams(address batchMinter, address token)
+        external
+        view
+        returns (uint256 duration, uint256 buffer, uint256 rewardPerSecond, uint256 lastUpdate);
+}
+
+/**
  * @title StableYieldAccumulator
  * @notice Consolidates yield strategy rewards into a single stablecoin for simplified distribution
  * @dev Implements pausable functionality following the Behodler3 pattern where both owner and pauser
@@ -412,11 +432,34 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Sets the reward token address
+     * @dev While the nudge rail is armed, the (nudge, _rewardToken) stream must already be
+     *      registered on the NudgeStreamer, otherwise the first claim() would revert with
+     *      NudgeStreamer__NotRegistered. This moves that failure to configuration time.
+     *
+     *      The check is deliberately conditional on all three legs of the rail being live
+     *      (nudgeSplit != 0 && nudgeStreamer != address(0) && nudge != address(0)). Deployment
+     *      scripts and tests set the reward token first, long before the nudge rail exists, and
+     *      an unconditional check would block them. In particular, without the
+     *      `nudge != address(0)` term a half-wired system would probe streams[address(0)][token]
+     *      and revert on a legitimate mid-configuration step.
+     *
+     *      This guard is one-directional: setNudgeAddress, setNudgeSplit and setNudgeStreamer can
+     *      each re-create an unregistered pair afterwards. Closing that requires treating
+     *      nudgeSplit as an arm/disarm flag rather than adding naive symmetric guards, which
+     *      would mutually deadlock a two-leg migration.
      * @param _rewardToken Address of the reward token (e.g., USDC)
      */
     function setRewardToken(address _rewardToken) external onlyOwner {
         if (_rewardToken == address(0)) revert ZeroAddress();
+
+        if (nudgeSplit != 0 && nudgeStreamer != address(0) && nudge != address(0)) {
+            (uint256 duration,,,) = INudgeStreamerStreams(nudgeStreamer).streams(nudge, _rewardToken);
+            if (duration == 0) revert NudgeStreamNotRegistered(nudge, _rewardToken);
+        }
+
+        address oldRewardToken = rewardToken;
         rewardToken = _rewardToken;
+        emit RewardTokenUpdated(oldRewardToken, _rewardToken);
     }
 
     /**
