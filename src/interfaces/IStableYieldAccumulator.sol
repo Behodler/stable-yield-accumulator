@@ -74,6 +74,13 @@ interface IStableYieldAccumulator {
     event PhlimboUpdated(address indexed oldPhlimbo, address indexed newPhlimbo);
 
     /**
+     * @notice Emitted when the reward token is updated
+     * @param oldRewardToken Previous reward token address
+     * @param newRewardToken New reward token address
+     */
+    event RewardTokenUpdated(address indexed oldRewardToken, address indexed newRewardToken);
+
+    /**
      * @notice Emitted when the nudge address is updated
      * @param oldNudge Previous nudge address (may be address(0))
      * @param newNudge New nudge address (may be address(0) to clear)
@@ -187,6 +194,16 @@ interface IStableYieldAccumulator {
      *      split-0 accumulator remains fully claimable with nudgeStreamer == address(0).
      */
     error NudgeStreamerNotConfigured();
+
+    /**
+     * @notice Thrown when setting a reward token for which the nudge stream is unregistered
+     * @dev Moves the streamer's `NudgeStreamer__NotRegistered` failure from claim-time to
+     *      configuration-time. Only enforced while the nudge rail is fully armed, i.e.
+     *      nudgeSplit != 0 && nudgeStreamer != address(0) && nudge != address(0).
+     * @param batchMinter The configured nudge batch minter
+     * @param token The reward token that has no registered stream
+     */
+    error NudgeStreamNotRegistered(address batchMinter, address token);
 
     /*//////////////////////////////////////////////////////////////
                         YIELD STRATEGY MANAGEMENT

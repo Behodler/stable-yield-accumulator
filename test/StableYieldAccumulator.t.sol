@@ -427,6 +427,7 @@ contract StableYieldAccumulatorTest is Test {
     event TokenUnpaused(address indexed token);
     event DiscountRateSet(uint256 oldRate, uint256 newRate);
     event PhlimboUpdated(address indexed oldPhlimbo, address indexed newPhlimbo);
+    event RewardTokenUpdated(address indexed oldRewardToken, address indexed newRewardToken);
     event RewardsClaimed(address indexed claimer, uint256 amountPaid, uint256 strategiesClaimed);
     event RewardsCollected(address indexed strategy, uint256 amount);
     event NudgeUpdated(address indexed oldNudge, address indexed newNudge);
@@ -1412,6 +1413,110 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setPhlimbo(phlimboAddr2);
 
         assertEq(accumulator.phlimbo(), phlimboAddr2, "Should update to second phlimbo");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    REWARD TOKEN MANAGEMENT TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_setRewardToken_StoresAddress() public {
+        accumulator.setRewardToken(address(rewardToken));
+
+        assertEq(accumulator.rewardToken(), address(rewardToken), "Should store reward token address");
+    }
+
+    function test_setRewardToken_EmitsRewardTokenUpdated() public {
+        vm.expectEmit(true, true, false, true);
+        emit RewardTokenUpdated(address(0), address(rewardToken));
+        accumulator.setRewardToken(address(rewardToken));
+
+        MockERC20 secondRewardToken = new MockERC20("Reward Token 2", "RWD2");
+
+        vm.expectEmit(true, true, false, true);
+        emit RewardTokenUpdated(address(rewardToken), address(secondRewardToken));
+        accumulator.setRewardToken(address(secondRewardToken));
+
+        assertEq(accumulator.rewardToken(), address(secondRewardToken), "Should update to second reward token");
+    }
+
+    function test_setRewardToken_RevertIf_ZeroAddress() public {
+        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
+        accumulator.setRewardToken(address(0));
+    }
+
+    function test_setRewardToken_RevertIf_NotOwner() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        accumulator.setRewardToken(address(rewardToken));
+    }
+
+    /// @notice With the nudge rail fully armed, a reward token with no registered stream is
+    ///         rejected at configuration time rather than surfacing on the first claim().
+    function test_setRewardToken_RevertIf_StreamNotRegistered() public {
+        _wireNudgeStreamer();
+        accumulator.setNudgeSplit(30);
+
+        // Never passed to streamer.registerStream, so streams[batchMinterMock][it].duration == 0.
+        MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IStableYieldAccumulator.NudgeStreamNotRegistered.selector,
+                address(batchMinterMock),
+                address(unregisteredToken)
+            )
+        );
+        accumulator.setRewardToken(address(unregisteredToken));
+
+        assertEq(accumulator.rewardToken(), address(0), "Reward token must be left untouched on revert");
+    }
+
+    /// @notice Guard active and satisfied: setUp registered (batchMinterMock, rewardToken).
+    function test_setRewardToken_Succeeds_WhenStreamRegistered() public {
+        _wireNudgeStreamer();
+        accumulator.setNudgeSplit(30);
+
+        vm.expectEmit(true, true, false, true);
+        emit RewardTokenUpdated(address(0), address(rewardToken));
+        accumulator.setRewardToken(address(rewardToken));
+
+        assertEq(accumulator.rewardToken(), address(rewardToken), "Registered stream should be accepted");
+    }
+
+    /// @notice nudgeSplit == 0 disarms the rail, so no stream lookup happens.
+    function test_setRewardToken_SkipsGuard_WhenNudgeSplitZero() public {
+        _wireNudgeStreamer();
+        assertEq(accumulator.nudgeSplit(), 0, "Split should default to 0");
+
+        MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+        accumulator.setRewardToken(address(unregisteredToken));
+
+        assertEq(accumulator.rewardToken(), address(unregisteredToken), "Guard must be skipped while split is 0");
+    }
+
+    /// @notice Mid-configuration path: nudge + split set, streamer not yet wired.
+    function test_setRewardToken_SkipsGuard_WhenStreamerUnset() public {
+        accumulator.setNudgeAddress(address(batchMinterMock));
+        accumulator.setNudgeSplit(30);
+        assertEq(accumulator.nudgeStreamer(), address(0), "Streamer should still be unset");
+
+        MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+        accumulator.setRewardToken(address(unregisteredToken));
+
+        assertEq(accumulator.rewardToken(), address(unregisteredToken), "Guard must be skipped without a streamer");
+    }
+
+    /// @notice Mid-configuration path: streamer + split set, nudge sink not yet wired. Without
+    ///         this carve-out the guard would probe streams[address(0)][token] and always revert.
+    function test_setRewardToken_SkipsGuard_WhenNudgeUnset() public {
+        accumulator.setNudgeStreamer(address(streamer));
+        accumulator.setNudgeSplit(30);
+        assertEq(accumulator.nudge(), address(0), "Nudge sink should still be unset");
+
+        MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+        accumulator.setRewardToken(address(unregisteredToken));
+
+        assertEq(accumulator.rewardToken(), address(unregisteredToken), "Guard must be skipped without a nudge sink");
     }
 
     /*//////////////////////////////////////////////////////////////
