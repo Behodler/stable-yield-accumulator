@@ -2545,6 +2545,16 @@ contract NFTClaimGateTest is Test {
         accumulator.setNFTMinter(address(0));
     }
 
+    /**
+     * @notice Expects the accumulator to make no NFT-gate calls (balanceOf / burn) on the minter
+     * @dev Selector-scoped rather than callee-wide so the test's own view reads of the mock
+     *      (e.g. burnCallCount) do not count against the expectation.
+     */
+    function _expectNoGateCalls() internal {
+        vm.expectCall(address(mockNFTMinter), abi.encodeWithSelector(MockNFTMinter.balanceOf.selector), 0);
+        vm.expectCall(address(mockNFTMinter), abi.encodeWithSelector(MockNFTMinter.burn.selector), 0);
+    }
+
     /*//////////////////////////////////////////////////////////////
                     setNFTMinter TESTS
     //////////////////////////////////////////////////////////////*/
@@ -2635,8 +2645,8 @@ contract NFTClaimGateTest is Test {
         uint256 burnCountBefore = mockNFTMinter.burnCallCount();
         uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
-        // The NFT minter must receive no calls at all (no balanceOf, no burn)
-        vm.expectCall(address(mockNFTMinter), bytes(""), 0);
+        // The accumulator must make no gate calls on the NFT minter (no balanceOf, no burn)
+        _expectNoGateCalls();
 
         vm.prank(claimer);
         accumulator.claim(1, 0, new address[](0));
@@ -2725,7 +2735,7 @@ contract NFTClaimGateTest is Test {
         uint256 phlimboRewardBefore = rewardToken.balanceOf(phlimboAddr);
         uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
 
-        vm.expectCall(address(mockNFTMinter), bytes(""), 0);
+        _expectNoGateCalls();
 
         vm.prank(claimer);
         accumulator.claim(nftIndex, 0, new address[](0));

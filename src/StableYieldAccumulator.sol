@@ -73,7 +73,10 @@ interface INudgeStreamerStreams {
  * 2. **Exchange Rate Mappings** - Tracks decimal places (6 for USDC, 18 for Dola, etc.) and exchange rates
  * 3. **No Oracles/AMMs** - Uses assumed 1:1 exchange rates for stablecoins (owner can adjust for permanent depegs)
  * 4. **Claim Mechanism** - External users swap their reward token holdings for pending yield strategy rewards
- * 5. **NFT Gate** - Claims require holding a valid NFT from the NFTMinter contract; exactly 1 NFT is burned per claim
+ * 5. **Optional NFT Gate** - When `nftMinter` is set, claims require holding a valid NFT from the NFTMinter
+ *    contract and exactly 1 NFT is burned per claim. When `nftMinter == address(0)` the gate is OFF: anyone
+ *    may claim, no NFT is checked or burned, and `nftIndex` is ignored. A freshly deployed accumulator is
+ *    therefore ungated until `setNFTMinter` is called with a non-zero address.
  *
  * ## Nudge share routing (story 026)
  *
@@ -205,8 +208,10 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice ERC1155 NFTMinter contract address for claim gating
-     * @dev Claims require holding at least 1 NFT from this contract; exactly 1 is burned per claim
+     * @notice ERC1155 NFTMinter contract address for claim gating; address(0) means the gate is OFF
+     * @dev When non-zero, claims require holding at least 1 NFT from this contract and exactly 1 is
+     *      burned per claim. When address(0) (the constructor default), claims are permissionless and
+     *      no NFT is checked or burned.
      */
     address public nftMinter;
 
@@ -523,10 +528,12 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Sets the NFTMinter contract address for claim gating
+     * @notice Sets the NFTMinter contract address for claim gating, or disables the gate
      * @dev The NFTMinter must be an ERC1155 contract that also implements INFTMinterV2.
      *      The StableYieldAccumulator must be registered as an authorized burner on the NFTMinter.
-     * @param _nftMinter Address of the NFTMinter contract
+     *      Passing address(0) disables the claim gate: claims become permissionless and burn nothing.
+     *      Setting a non-zero address again re-enables the gate.
+     * @param _nftMinter Address of the NFTMinter contract, or address(0) to disable the claim gate
      */
     function setNFTMinter(address _nftMinter) external onlyOwner {
         address oldNFTMinter = nftMinter;
@@ -543,13 +550,15 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      * @dev Full claim flow:
      *      1. Validate every entry in exemptStrategies is registered (BEFORE burning the NFT,
      *         so a bad input does not consume the caller's NFT)
-     *      2. Verify caller holds a valid NFT and burn 1 unit
+     *      2. Only when the gate is on (nftMinter != address(0)): verify caller holds a valid NFT
+     *         and burn 1 unit. When the gate is off this step is skipped entirely.
      *      3. Calculate total pending yield across all non-exempt strategies (normalized to 18 decimals)
      *      4. Apply discount to get claimer payment amount
      *      5. Transfer rewardToken FROM claimer TO phlimbo
      *      6. skimSurplus each non-exempt strategy, sending the batched surplus of ALL its
      *         authorized clients TO the claimer
-     * @param nftIndex Dispatcher config index in NFTMinter for the NFT to validate and burn
+     * @param nftIndex Dispatcher config index in NFTMinter for the NFT to validate and burn.
+     *        Ignored when the gate is off (nftMinter == address(0)).
      * @param minRewardTokenSupplied Slippage protection; reverts with InsufficientYield if actual
      *        payment is less than this value. Pass 0 to disable.
      * @param exemptStrategies Registered strategies to skip in the iteration loop. Empty array
@@ -571,8 +580,8 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
             if (!isRegisteredStrategy[exemptStrategies[i]]) revert ExemptStrategyNotRegistered();
         }
 
-        // NFT gate: verify caller holds a valid NFT and burn 1 unit
-        _validateAndBurnNFT(msg.sender, nftIndex);
+        // Optional NFT gate: when nftMinter is unset the gate is off and nftIndex is ignored
+        if (nftMinter != address(0)) _validateAndBurnNFT(msg.sender, nftIndex);
 
         uint256 totalNormalizedYield = 0;
         uint256 strategiesWithYield = 0;
@@ -650,12 +659,12 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Internal helper to validate NFT ownership and burn 1 unit
-     * @dev Uses the provided index for O(1) lookup instead of iterating all dispatcher configs
+     * @dev Uses the provided index for O(1) lookup instead of iterating all dispatcher configs.
+     *      Only called when the gate is on; the caller (claim) guarantees nftMinter != address(0).
      * @param caller The address to check for NFT ownership
      * @param index The dispatcher config index in NFTMinter
      */
     function _validateAndBurnNFT(address caller, uint256 index) internal {
-        require(nftMinter != address(0), "NFT minter not configured");
         require(index > 0, "Invalid index");
 
         if (IERC1155(nftMinter).balanceOf(caller, index) > 0) {
@@ -819,13 +828,14 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Checks if a specific caller can claim based on NFT holdings
-     * @dev Returns true if the caller holds any valid NFT from the minter
+     * @dev Returns true when the gate is off (nftMinter == address(0)), since anyone can claim.
+     *      Otherwise returns true if the caller holds any valid NFT from the minter.
      * @param caller Address to check
-     * @return True if the caller holds a valid NFT
+     * @return True if the gate is off or the caller holds a valid NFT
      */
     function canClaim(address caller) external view returns (bool) {
         if (nftMinter == address(0)) {
-            return false;
+            return true;
         }
 
         uint256 count = INFTMinterV2(nftMinter).nextIndex();

@@ -169,6 +169,7 @@ interface IStableYieldAccumulator {
 
     /**
      * @notice Thrown when caller has no valid NFT for claiming
+     * @dev Only raised while the claim gate is on (nftMinter != address(0))
      */
     error NoValidNFT();
 
@@ -363,14 +364,16 @@ interface IStableYieldAccumulator {
      * @notice Claims all pending yield from all strategies by paying with reward token
      * @dev Full flow:
      *      1. Validate every entry in exemptStrategies is currently registered (BEFORE the NFT burn)
-     *      2. Verify caller holds a valid NFT at the given index and burn 1 unit
+     *      2. Only when the gate is on (nftMinter != address(0)): verify caller holds a valid NFT
+     *         at the given index and burn 1 unit. Skipped entirely when the gate is off.
      *      3. Iterate registered strategies, skipping any present in exemptStrategies
      *      4. Calculate total pending yield (normalized) from non-exempt strategies
      *      5. Apply discount to get claimer payment
      *      6. TransferFrom claimer to phlimbo
      *      7. skimSurplus each non-exempt strategy, sending the batched surplus of all its
      *         authorized clients to the claimer
-     * @param nftIndex The dispatcher config index in NFTMinter identifying which NFT to validate and burn
+     * @param nftIndex The dispatcher config index in NFTMinter identifying which NFT to validate and burn.
+     *        Ignored when the gate is off (nftMinter == address(0)).
      * @param minRewardTokenSupplied Minimum acceptable payment amount in reward token decimals.
      *        Reverts with InsufficientYield if actual payment is less than this value.
      *        Pass 0 to disable slippage protection.
@@ -421,14 +424,16 @@ interface IStableYieldAccumulator {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Sets the NFTMinter contract address for claim gating
-     * @param _nftMinter Address of the NFTMinter ERC1155 contract
+     * @notice Sets the NFTMinter contract address for claim gating, or disables the gate
+     * @dev address(0) disables the claim gate: claims become permissionless and burn nothing.
+     * @param _nftMinter Address of the NFTMinter ERC1155 contract, or address(0) to disable the gate
      */
     function setNFTMinter(address _nftMinter) external;
 
     /**
      * @notice Gets the current NFTMinter address
-     * @return Address of the NFTMinter contract
+     * @dev address(0) means the claim gate is off (the default for a freshly deployed accumulator)
+     * @return Address of the NFTMinter contract, or address(0) when the gate is off
      */
     function nftMinter() external view returns (address);
 
@@ -438,9 +443,10 @@ interface IStableYieldAccumulator {
 
     /**
      * @notice Checks if a specific caller can claim based on NFT holdings
-     * @dev Returns true if the caller holds any valid NFT from the minter
+     * @dev Returns true when the gate is off (nftMinter == address(0)), since anyone can claim.
+     *      Otherwise returns true if the caller holds any valid NFT from the minter.
      * @param caller Address to check
-     * @return True if the caller holds a valid NFT
+     * @return True if the gate is off or the caller holds a valid NFT
      */
     function canClaim(address caller) external view returns (bool);
 }

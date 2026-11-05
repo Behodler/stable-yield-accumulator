@@ -49,7 +49,8 @@ The discount incentivizes external actors to pay gas costs for the conversion.
 1. **Yield Strategy List** - Dynamic, owner-managed list of yield strategies
 2. **Token Config Mapping** - Per-token: decimals, exchange rate, paused status
 3. **Global Discount Rate** - Incentive for claimers (e.g., 2%)
-4. **Owner Controls**:
+4. **Optional NFT Claim Gate** - `nftMinter` set: claims burn 1 claim NFT; `nftMinter == address(0)`: gate off, anyone may claim and `nftIndex` is ignored
+5. **Owner Controls**:
    - Add/remove yield strategies
    - Update exchange rates (for permanent depegs)
    - Pause tokens (for black swan events)
