@@ -2535,6 +2535,16 @@ contract NFTClaimGateTest is Test {
         accumulator.approvePhlimbo(type(uint256).max);
     }
 
+    /**
+     * @notice Helper to set up the same claim scenario with the NFT gate switched OFF
+     * @dev Wires the minter exactly as the gated helper does, then disables the gate with
+     *      setNFTMinter(address(0)) — the production gate-off signal.
+     */
+    function _setupClaimGateOff(uint256 yieldAmount) internal {
+        _setupClaimWithNFT(yieldAmount);
+        accumulator.setNFTMinter(address(0));
+    }
+
     /*//////////////////////////////////////////////////////////////
                     setNFTMinter TESTS
     //////////////////////////////////////////////////////////////*/
@@ -2616,17 +2626,23 @@ contract NFTClaimGateTest is Test {
         accumulator.claim(1, 0, new address[](0));
     }
 
-    function test_claim_RevertsWhenNFTMinterNotConfigured() public {
-        // Setup without setting NFT minter
-        accumulator.setPhlimbo(phlimboAddr);
-        accumulator.setRewardToken(address(rewardToken));
+    function test_claim_SucceedsWhenNFTMinterNotConfigured() public {
+        uint256 yieldAmount = 100e18;
+        _setupClaimGateOff(yieldAmount);
 
-        // Do NOT set NFT minter
-        // accumulator.setNFTMinter(...)
+        // Claimer holds NO NFT; with the gate off this must not matter
+        assertEq(mockNFTMinter.balances(claimer, 1), 0, "Claimer must hold no NFT");
+        uint256 burnCountBefore = mockNFTMinter.burnCallCount();
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+
+        // The NFT minter must receive no calls at all (no balanceOf, no burn)
+        vm.expectCall(address(mockNFTMinter), bytes(""), 0);
 
         vm.prank(claimer);
-        vm.expectRevert("NFT minter not configured");
         accumulator.claim(1, 0, new address[](0));
+
+        assertEq(strategyToken1.balanceOf(claimer) - claimerYieldBefore, yieldAmount, "Claimer should receive yield");
+        assertEq(mockNFTMinter.burnCallCount(), burnCountBefore, "No NFT should be burned when gate is off");
     }
 
     function test_claim_BurnsExactlyOneNFT() public {
@@ -2697,6 +2713,95 @@ contract NFTClaimGateTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+                    OPTIONAL GATE (GATE OFF) TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function _assertGateOffClaimSucceedsForIndex(uint256 nftIndex) internal {
+        uint256 yieldAmount = 100e18;
+        _setupClaimGateOff(yieldAmount);
+
+        uint256 expectedPayment = yieldAmount * 98 / 100; // 2% discount
+        uint256 claimerRewardBefore = rewardToken.balanceOf(claimer);
+        uint256 phlimboRewardBefore = rewardToken.balanceOf(phlimboAddr);
+        uint256 claimerYieldBefore = strategyToken1.balanceOf(claimer);
+
+        vm.expectCall(address(mockNFTMinter), bytes(""), 0);
+
+        vm.prank(claimer);
+        accumulator.claim(nftIndex, 0, new address[](0));
+
+        assertEq(strategyToken1.balanceOf(claimer) - claimerYieldBefore, yieldAmount, "Surplus paid to claimer");
+        assertEq(claimerRewardBefore - rewardToken.balanceOf(claimer), expectedPayment, "Claimer paid reward token");
+        assertEq(rewardToken.balanceOf(phlimboAddr) - phlimboRewardBefore, expectedPayment, "Reward pulled to phlimbo");
+        assertEq(mockNFTMinter.burnCallCount(), 0, "Nothing burned when gate is off");
+    }
+
+    function test_claim_GateOff_IgnoresNftIndexZero() public {
+        _assertGateOffClaimSucceedsForIndex(0);
+    }
+
+    function test_claim_GateOff_IgnoresNftIndexOne() public {
+        _assertGateOffClaimSucceedsForIndex(1);
+    }
+
+    function test_claim_GateOff_IgnoresNftIndex999() public {
+        _assertGateOffClaimSucceedsForIndex(999);
+    }
+
+    function test_claim_GateOff_PayoutIdenticalToGatedClaim() public {
+        uint256 yieldAmount = 100e18;
+        uint256 snap = vm.snapshotState();
+
+        // Gated claim with an NFT
+        _setupClaimWithNFT(yieldAmount);
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+        uint256 rewardBefore = rewardToken.balanceOf(claimer);
+        uint256 phlimboBefore = rewardToken.balanceOf(phlimboAddr);
+        uint256 yieldBefore = strategyToken1.balanceOf(claimer);
+        vm.prank(claimer);
+        accumulator.claim(1, 0, new address[](0));
+        uint256 gatedPaid = rewardBefore - rewardToken.balanceOf(claimer);
+        uint256 gatedPhlimbo = rewardToken.balanceOf(phlimboAddr) - phlimboBefore;
+        uint256 gatedYield = strategyToken1.balanceOf(claimer) - yieldBefore;
+
+        vm.revertToState(snap);
+
+        // Ungated claim with no NFT, same yield
+        _setupClaimGateOff(yieldAmount);
+        rewardBefore = rewardToken.balanceOf(claimer);
+        phlimboBefore = rewardToken.balanceOf(phlimboAddr);
+        yieldBefore = strategyToken1.balanceOf(claimer);
+        vm.prank(claimer);
+        accumulator.claim(0, 0, new address[](0));
+
+        assertEq(rewardBefore - rewardToken.balanceOf(claimer), gatedPaid, "Claimer payment identical");
+        assertEq(rewardToken.balanceOf(phlimboAddr) - phlimboBefore, gatedPhlimbo, "Phlimbo receipt identical");
+        assertEq(strategyToken1.balanceOf(claimer) - yieldBefore, gatedYield, "Surplus to claimer identical");
+    }
+
+    function test_claim_ReEnablingGate_RevertsWithoutNFT() public {
+        uint256 yieldAmount = 100e18;
+        _setupClaimWithNFT(yieldAmount);
+
+        accumulator.setNFTMinter(address(0));
+        accumulator.setNFTMinter(address(mockNFTMinter));
+
+        vm.prank(claimer);
+        vm.expectRevert(IStableYieldAccumulator.NoValidNFT.selector);
+        accumulator.claim(1, 0, new address[](0));
+    }
+
+    function test_claim_Gated_RevertsWithInvalidIndexZero() public {
+        uint256 yieldAmount = 100e18;
+        _setupClaimWithNFT(yieldAmount);
+        mockNFTMinter.mintNFT(claimer, 1, 1);
+
+        vm.prank(claimer);
+        vm.expectRevert("Invalid index");
+        accumulator.claim(0, 0, new address[](0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
                     canClaim VIEW FUNCTION TESTS
     //////////////////////////////////////////////////////////////*/
 
@@ -2715,9 +2820,17 @@ contract NFTClaimGateTest is Test {
         assertFalse(accumulator.canClaim(claimer), "Should return false when caller has no NFT");
     }
 
-    function test_canClaim_FalseWhenNFTMinterNotSet() public {
-        // Don't set NFT minter
-        assertFalse(accumulator.canClaim(claimer), "Should return false when nftMinter not set");
+    function test_canClaim_TrueWhenNFTMinterNotSet() public {
+        // Don't set NFT minter: the gate is off, so anyone can claim
+        assertTrue(accumulator.canClaim(claimer), "Should return true when nftMinter not set (gate off)");
+    }
+
+    function test_canClaim_TrueAfterGateDisabled() public {
+        accumulator.setNFTMinter(address(mockNFTMinter));
+        assertFalse(accumulator.canClaim(claimer), "Gated: no NFT means cannot claim");
+
+        accumulator.setNFTMinter(address(0));
+        assertTrue(accumulator.canClaim(claimer), "Gate off: anyone can claim");
     }
 
     function test_canClaim_SkipsUnusedDispatchers() public {
