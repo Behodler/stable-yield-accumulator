@@ -47,7 +47,7 @@ The discount incentivizes external actors to pay gas costs for the conversion.
 ### Key Components
 
 1. **Yield Strategy List** - Dynamic, owner-managed list of yield strategies
-2. **Token Config Mapping** - Per-token: decimals, exchange rate, paused status
+2. **Token Config Mapping** - Per-token: decimals, exchange rate, paused status, `configured` flag. `setTokenConfig` is the only writer of `configured` (never cleared) and accepts decimals 1..18 and a rate > 0 (1e18 = 1:1). A token must be configured before `setRewardToken` or `addYieldStrategy` will accept it; an unconfigured token reverts `TokenNotConfigured` everywhere, including normalization (no 18-decimal 1:1 default)
 3. **Global Discount Rate** - Incentive for claimers (e.g., 2%)
 4. **Optional NFT Claim Gate** - `nftMinter` set: claims burn 1 claim NFT; `nftMinter == address(0)`: gate off, anyone may claim and `nftIndex` is ignored
 5. **Owner Controls**:
