@@ -669,6 +669,9 @@ contract StableYieldAccumulatorTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_addYieldStrategy_AddsToList() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         // GREEN PHASE: Test actual behavior with token parameter
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
@@ -682,6 +685,9 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_addYieldStrategy_EmitsEvent() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         // GREEN PHASE: Verify event emission
         vm.expectEmit(true, false, false, true);
         emit YieldStrategyAdded(address(mockStrategy1));
@@ -705,6 +711,9 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_addYieldStrategy_RevertIf_AlreadyRegistered() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
         vm.expectRevert(IStableYieldAccumulator.StrategyAlreadyRegistered.selector);
@@ -712,6 +721,10 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_removeYieldStrategy_RemovesFromList() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
 
@@ -725,6 +738,9 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_removeYieldStrategy_EmitsEvent() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
         vm.expectEmit(true, false, false, true);
@@ -744,6 +760,10 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_getYieldStrategies_ReturnsAllStrategies() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+
         address[] memory strategiesBefore = accumulator.getYieldStrategies();
         assertEq(strategiesBefore.length, 0, "Should start with empty array");
 
@@ -988,9 +1008,7 @@ contract StableYieldAccumulatorTest is Test {
         // An unfunded attacker cannot take the yield for ~0 payment
         vm.prank(attacker);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                IERC20Errors.ERC20InsufficientAllowance.selector, address(accumulator), 0, 49_000e6
-            )
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(accumulator), 0, 49_000e6)
         );
         accumulator.claim(0, 0, new address[](0));
     }
@@ -1043,6 +1061,12 @@ contract StableYieldAccumulatorTest is Test {
     function _setupClaimScenario(uint256 yieldAmount) internal returns (address claimer) {
         claimer = makeAddr("claimer");
 
+        // Tokens must be configured before setRewardToken / addYieldStrategy (story 029)
+        // Set token config for strategy token (18 decimals, 1:1 rate)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        // Set token config for reward token (18 decimals, 1:1 rate)
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         // Setup accumulator config
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
@@ -1051,11 +1075,6 @@ contract StableYieldAccumulatorTest is Test {
 
         // Add strategy with token
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-
-        // Set token config for strategy token (18 decimals, 1:1 rate)
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        // Set token config for reward token (18 decimals, 1:1 rate)
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         // Set up mock strategy with yield
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);
@@ -1125,6 +1144,11 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_claim_MultipleStrategies() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         address claimer = makeAddr("claimer");
 
         // Setup both strategies
@@ -1135,10 +1159,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
-
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         // Set yields: 60e18 from strategy1, 40e18 from strategy2 = 100e18 total
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
@@ -1203,6 +1223,10 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_claim_RevertIf_NoYield() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         address claimer = makeAddr("claimer");
 
         // Setup without any yield
@@ -1210,7 +1234,6 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setNFTMinter(address(mockNFTMinter));
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
 
         // No yield set
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 0);
@@ -1224,6 +1247,9 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_claim_RevertIf_PhlimboNotSet() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         accumulator.setRewardToken(address(rewardToken));
 
         vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
@@ -1258,6 +1284,10 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_calculateClaimAmount_NoDiscount() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         address claimer = makeAddr("claimer");
 
         accumulator.setPhlimbo(phlimboAddr);
@@ -1265,8 +1295,6 @@ contract StableYieldAccumulatorTest is Test {
         accumulator.setDiscountRate(0); // No discount
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 100e18);
 
@@ -1285,6 +1313,9 @@ contract StableYieldAccumulatorTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_getYield_ReturnsActualYieldFromStrategy() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         // Setup strategy with token and minter
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
@@ -1299,6 +1330,9 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_getYield_ReturnsZeroIfNoClients() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         // No clients registered on the strategy
 
@@ -1307,6 +1341,9 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_getYield_ReturnsZeroIfNoYield() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
         // Set principal but no yield
@@ -1322,6 +1359,10 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_getTotalYield_SumsAllStrategies() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+
         // Setup two strategies
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
@@ -1368,7 +1409,9 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_fuzz_normalizeAmount_VariousDecimals(uint8 decimals) public {
-        vm.assume(decimals <= 18);
+        // decimals == 0 now reverts InvalidDecimals (story 029); covered by
+        // test_setTokenConfig_RevertIf_ZeroDecimals
+        vm.assume(decimals >= 1 && decimals <= 18);
         accumulator.setTokenConfig(address(strategyToken1), decimals, 1e18);
 
         IStableYieldAccumulator.TokenConfig memory config = accumulator.getTokenConfig(address(strategyToken1));
@@ -1379,15 +1422,16 @@ contract StableYieldAccumulatorTest is Test {
                     INTEGRATION SCENARIOS
     //////////////////////////////////////////////////////////////*/
 
-    function test_fullFlow_AddStrategySetConfigCollectClaim() public {
+    function test_fullFlow_SetConfigAddStrategyCollectClaim() public {
         address claimer = makeAddr("claimer");
 
-        // 1. Add strategy with token
-        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-
-        // 2. Set token config (18 decimals for easy testing)
+        // 1. Set token config (18 decimals for easy testing). Must precede addYieldStrategy
+        //    and setRewardToken (story 029)
         accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
         accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
+        // 2. Add strategy with token
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
 
         // 3. Set discount rate
         accumulator.setDiscountRate(200);
@@ -1434,6 +1478,10 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     function test_multipleStrategies_GetTotalYield() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+
         // Setup
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
@@ -1591,17 +1639,24 @@ contract StableYieldAccumulatorTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_setRewardToken_StoresAddress() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         accumulator.setRewardToken(address(rewardToken));
 
         assertEq(accumulator.rewardToken(), address(rewardToken), "Should store reward token address");
     }
 
     function test_setRewardToken_EmitsRewardTokenUpdated() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         vm.expectEmit(true, true, false, true);
         emit RewardTokenUpdated(address(0), address(rewardToken));
         accumulator.setRewardToken(address(rewardToken));
 
         MockERC20 secondRewardToken = new MockERC20("Reward Token 2", "RWD2");
+        accumulator.setTokenConfig(address(secondRewardToken), 18, 1e18);
 
         vm.expectEmit(true, true, false, true);
         emit RewardTokenUpdated(address(rewardToken), address(secondRewardToken));
@@ -1629,6 +1684,8 @@ contract StableYieldAccumulatorTest is Test {
 
         // Never passed to streamer.registerStream, so streams[batchMinterMock][it].duration == 0.
         MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+        // Configured so setRewardToken gets past the TokenNotConfigured check (story 029)
+        accumulator.setTokenConfig(address(unregisteredToken), 18, 1e18);
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -1644,6 +1701,8 @@ contract StableYieldAccumulatorTest is Test {
 
     /// @notice Guard active and satisfied: setUp registered (batchMinterMock, rewardToken).
     function test_setRewardToken_Succeeds_WhenStreamRegistered() public {
+        // Configure the reward token first: setRewardToken requires it (story 029)
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
         _wireNudgeStreamer();
         accumulator.setNudgeSplit(30);
 
@@ -1660,6 +1719,8 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(accumulator.nudgeSplit(), 0, "Split should default to 0");
 
         MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+        // Configured so setRewardToken gets past the TokenNotConfigured check (story 029)
+        accumulator.setTokenConfig(address(unregisteredToken), 18, 1e18);
         accumulator.setRewardToken(address(unregisteredToken));
 
         assertEq(accumulator.rewardToken(), address(unregisteredToken), "Guard must be skipped while split is 0");
@@ -1672,6 +1733,8 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(accumulator.nudgeStreamer(), address(0), "Streamer should still be unset");
 
         MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+        // Configured so setRewardToken gets past the TokenNotConfigured check (story 029)
+        accumulator.setTokenConfig(address(unregisteredToken), 18, 1e18);
         accumulator.setRewardToken(address(unregisteredToken));
 
         assertEq(accumulator.rewardToken(), address(unregisteredToken), "Guard must be skipped without a streamer");
@@ -1685,6 +1748,8 @@ contract StableYieldAccumulatorTest is Test {
         assertEq(accumulator.nudge(), address(0), "Nudge sink should still be unset");
 
         MockERC20 unregisteredToken = new MockERC20("Unregistered", "UNREG");
+        // Configured so setRewardToken gets past the TokenNotConfigured check (story 029)
+        accumulator.setTokenConfig(address(unregisteredToken), 18, 1e18);
         accumulator.setRewardToken(address(unregisteredToken));
 
         assertEq(accumulator.rewardToken(), address(unregisteredToken), "Guard must be skipped without a nudge sink");
@@ -1710,13 +1775,13 @@ contract StableYieldAccumulatorTest is Test {
 
         // Setup accumulator
 
+        // Configure token decimals and exchange rates (1:1). Must precede addYieldStrategy (story 029)
+        accumulator.setTokenConfig(address(usdcLike), 6, 1e18); // 6 decimals
+        accumulator.setTokenConfig(address(dolaLike), 18, 1e18); // 18 decimals
+
         // Add strategies
         accumulator.addYieldStrategy(address(usdcStrategy), address(usdcLike));
         accumulator.addYieldStrategy(address(dolaStrategy), address(dolaLike));
-
-        // Configure token decimals and exchange rates (1:1)
-        accumulator.setTokenConfig(address(usdcLike), 6, 1e18); // 6 decimals
-        accumulator.setTokenConfig(address(dolaLike), 18, 1e18); // 18 decimals
 
         // Set yields:
         // - USDC strategy: 300 USDC yield (in 6 decimals = 300e6)
@@ -1750,6 +1815,11 @@ contract StableYieldAccumulatorTest is Test {
     /// @notice claim() succeeds when one strategy's token is paused,
     ///         collecting yield only from the unpaused strategy.
     function test_claim_SucceedsWithOnePausedToken() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         address claimer = makeAddr("claimer");
 
         // Setup two strategies
@@ -1760,10 +1830,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
-
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         // Set yields: 60e18 from strategy1, 40e18 from strategy2
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
@@ -1810,6 +1876,11 @@ contract StableYieldAccumulatorTest is Test {
 
     /// @notice claim() returns the same total as calculateClaimAmount() when a token is paused.
     function test_claim_ConsistentWithCalculateClaimAmount_WhenTokenPaused() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         address claimer = makeAddr("claimer");
 
         // Setup two strategies
@@ -1820,10 +1891,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
-
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         // Set yields: 60e18 from strategy1, 40e18 from strategy2
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
@@ -1865,6 +1932,11 @@ contract StableYieldAccumulatorTest is Test {
 
     /// @notice Regression: claim() works normally when no tokens are paused.
     function test_claim_WorksNormally_NoTokensPaused() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         address claimer = makeAddr("claimer");
 
         // Setup two strategies — no tokens paused
@@ -1875,10 +1947,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
-
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         // Set yields: 60e18 from strategy1, 40e18 from strategy2 = 100e18 total
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 60e18);
@@ -1931,7 +1999,8 @@ contract StableYieldAccumulatorTest is Test {
         MockPhlimbo phlimboMock = new MockPhlimbo(address(usdtToken));
         phlimboMock.setYieldAccumulator(address(acc));
 
-        // Configure accumulator
+        // Configure accumulator (token config first: setRewardToken requires it, story 029)
+        acc.setTokenConfig(address(usdtToken), 18, 1e18);
         acc.setPhlimbo(address(phlimboMock));
         acc.setRewardToken(address(usdtToken));
 
@@ -2188,15 +2257,17 @@ contract StableYieldAccumulatorTest is Test {
         // Use no discount and identity normalization so the actualPayment equals the yield exactly.
         address claimer = makeAddr("claimer");
 
+        // Configure (18, 1e18) so normalize/denormalize is identity. This must precede
+        // setRewardToken / addYieldStrategy (story 029: there is no unconfigured default)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setDiscountRate(0); // 0% discount so actualPayment == yield
         accumulator.setNFTMinter(address(mockNFTMinter));
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-
-        // Don't configure decimals so normalize/denormalize is identity
-        // (decimals==0 and rate==0 => returns amount as-is)
 
         // actualPayment will be 7
         uint256 yieldAmount = 7;
@@ -2399,6 +2470,11 @@ contract StableYieldAccumulatorTest is Test {
     function _setupTwoStrategiesScenario(uint256 yield1, uint256 yield2) internal returns (address claimer) {
         claimer = makeAddr("claimer");
 
+        // Tokens must be configured before setRewardToken / addYieldStrategy (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
         accumulator.setDiscountRate(200); // 2% discount
@@ -2406,10 +2482,6 @@ contract StableYieldAccumulatorTest is Test {
 
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
         accumulator.addYieldStrategy(address(mockStrategy2), address(strategyToken2));
-
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yield1);
         mockStrategy2.setBalances(address(strategyToken2), minterAddr, 500e18, yield2);
@@ -2523,6 +2595,11 @@ contract StableYieldAccumulatorTest is Test {
 
     /// @notice Green-phase / M-04 mitigation: a reverting strategy bricks claim() unless exempted.
     function test_claim_RoutesAroundRevertingStrategy() public {
+        // Configure tokens first: addYieldStrategy / setRewardToken require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         address claimer = makeAddr("claimer");
 
         // Setup
@@ -2537,10 +2614,6 @@ contract StableYieldAccumulatorTest is Test {
         // Broken strategy — always reverts on skimSurplus
         MockRevertingYieldStrategy broken = new MockRevertingYieldStrategy();
         accumulator.addYieldStrategy(address(broken), address(strategyToken2));
-
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(strategyToken2), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         uint256 healthyYield = 60e18;
         uint256 brokenYield = 40e18;
@@ -2678,6 +2751,10 @@ contract NFTClaimGateTest is Test {
      * @notice Helper to set up a complete claim scenario with NFT gate
      */
     function _setupClaimWithNFT(uint256 yieldAmount) internal {
+        // Set token config first: setRewardToken / addYieldStrategy require it (story 029)
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+
         // Setup basic claim infrastructure
         accumulator.setPhlimbo(phlimboAddr);
         accumulator.setRewardToken(address(rewardToken));
@@ -2686,10 +2763,6 @@ contract NFTClaimGateTest is Test {
 
         // Add strategy with token
         accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
-
-        // Set token config
-        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
-        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
 
         // Set up mock strategy with yield
         mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, yieldAmount);

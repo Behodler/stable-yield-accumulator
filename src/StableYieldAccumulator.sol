@@ -152,7 +152,10 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Mapping of token addresses to their configuration
-     * @dev Stores decimals, normalized exchange rate, and pause status for each token
+     * @dev Stores decimals, normalized exchange rate, pause status and the configured flag for
+     *      each token. A token must be configured via setTokenConfig before it is registered as a
+     *      strategy token (addYieldStrategy) or set as the reward token (setRewardToken). An
+     *      unconfigured token has no default pricing: normalization reverts TokenNotConfigured.
      */
     mapping(address => TokenConfig) public tokenConfigs;
 
@@ -302,13 +305,16 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Adds a new yield strategy to the registry
-     * @dev Validates zero address and duplicate registration
+     * @dev Validates zero addresses, then that `token` has been configured via setTokenConfig
+     *      (reverts TokenNotConfigured otherwise), then duplicate registration. Configure the
+     *      token first so its yield can never be priced with a missing config (audit-15 M-01).
      * @param strategy Address of the yield strategy to add
      * @param token Address of the underlying token that the strategy handles
      */
     function addYieldStrategy(address strategy, address token) external override onlyOwner {
         if (strategy == address(0)) revert ZeroAddress();
         if (token == address(0)) revert ZeroAddress();
+        if (!tokenConfigs[token].configured) revert TokenNotConfigured(token);
         if (isRegisteredStrategy[strategy]) revert StrategyAlreadyRegistered();
 
         yieldStrategies.push(strategy);
@@ -353,18 +359,23 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Sets or updates the configuration for a token
-     * @dev Validates zero address and decimal constraints
+     * @notice Sets or updates the configuration for a token and marks it configured
+     * @dev Must be called for a token before it is passed to addYieldStrategy or setRewardToken.
+     *      Reverts, in order: ZeroAddress if `token` is zero, InvalidDecimals if `decimals` is 0
+     *      or exceeds 18, InvalidExchangeRate if `normalizedExchangeRate` is 0. Fields are written
+     *      individually so the paused flag is preserved. `configured` is never cleared.
      * @param token Address of the token
-     * @param decimals Number of decimal places (must be <= 18)
-     * @param normalizedExchangeRate Exchange rate normalized to 18 decimals
+     * @param decimals Number of decimal places (1..18 inclusive)
+     * @param normalizedExchangeRate Exchange rate normalized to 18 decimals; must be > 0 (1e18 = 1:1)
      */
     function setTokenConfig(address token, uint8 decimals, uint256 normalizedExchangeRate) external override onlyOwner {
         if (token == address(0)) revert ZeroAddress();
-        if (decimals > 18) revert InvalidDecimals();
+        if (decimals == 0 || decimals > 18) revert InvalidDecimals();
+        if (normalizedExchangeRate == 0) revert InvalidExchangeRate();
 
         tokenConfigs[token].decimals = decimals;
         tokenConfigs[token].normalizedExchangeRate = normalizedExchangeRate;
+        tokenConfigs[token].configured = true;
         emit TokenConfigSet(token, decimals, normalizedExchangeRate);
     }
 
@@ -437,7 +448,10 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Sets the reward token address
-     * @dev While the nudge rail is armed, the (nudge, _rewardToken) stream must already be
+     * @dev `_rewardToken` must already be configured via setTokenConfig, otherwise this reverts
+     *      TokenNotConfigured. That check runs before the nudge-stream guard below.
+     *
+     *      While the nudge rail is armed, the (nudge, _rewardToken) stream must already be
      *      registered on the NudgeStreamer, otherwise the first claim() would revert with
      *      NudgeStreamer__NotRegistered. This moves that failure to configuration time.
      *
@@ -456,6 +470,7 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
      */
     function setRewardToken(address _rewardToken) external onlyOwner {
         if (_rewardToken == address(0)) revert ZeroAddress();
+        if (!tokenConfigs[_rewardToken].configured) revert TokenNotConfigured(_rewardToken);
 
         if (nudgeSplit != 0 && nudgeStreamer != address(0) && nudge != address(0)) {
             (uint256 duration,,,) = INudgeStreamerStreams(nudgeStreamer).streams(nudge, _rewardToken);
@@ -714,18 +729,16 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Normalizes an amount from token decimals to 18 decimals
+     * @dev Reverts TokenNotConfigured if `token` has no config; there is no 18-decimal default
      * @param amount The amount in token decimals
      * @param token The token address to get decimals from
      * @return The amount normalized to 18 decimals
      */
     function _normalizeAmount(uint256 amount, address token) internal view returns (uint256) {
+        if (!tokenConfigs[token].configured) revert TokenNotConfigured(token);
+
         uint8 decimals = tokenConfigs[token].decimals;
         uint256 exchangeRate = tokenConfigs[token].normalizedExchangeRate;
-
-        // If no config set, assume 18 decimals and 1:1 rate
-        if (decimals == 0 && exchangeRate == 0) {
-            return amount;
-        }
 
         // Scale to 18 decimals
         uint256 scaled = amount;
@@ -745,18 +758,16 @@ contract StableYieldAccumulator is Ownable, Pausable, ReentrancyGuard, IPausable
 
     /**
      * @notice Denormalizes an amount from 18 decimals to token decimals
+     * @dev Reverts TokenNotConfigured if `token` has no config; there is no 18-decimal default
      * @param amount The amount in 18 decimals
      * @param token The token address to get decimals from
      * @return The amount in token decimals
      */
     function _denormalizeAmount(uint256 amount, address token) internal view returns (uint256) {
+        if (!tokenConfigs[token].configured) revert TokenNotConfigured(token);
+
         uint8 decimals = tokenConfigs[token].decimals;
         uint256 exchangeRate = tokenConfigs[token].normalizedExchangeRate;
-
-        // If no config set, assume 18 decimals and 1:1 rate
-        if (decimals == 0 && exchangeRate == 0) {
-            return amount;
-        }
 
         // Reverse exchange rate first
         uint256 scaled = amount;
