@@ -12,15 +12,22 @@ interface IStableYieldAccumulator {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Configuration for a reward token
-     * @param decimals Number of decimal places for the token (max 18)
-     * @param normalizedExchangeRate Exchange rate normalized to 18 decimals
+     * @notice Configuration for a strategy token or the reward token
+     * @dev A token must be configured (via setTokenConfig) before it can be registered as a
+     *      strategy token or set as the reward token, and before any amount in it is normalized
+     *      or denormalized. There is no default: an unconfigured token reverts TokenNotConfigured
+     *      rather than being priced as 18 decimals at 1:1.
+     * @param decimals Number of decimal places for the token (1..18 inclusive once configured)
+     * @param normalizedExchangeRate Exchange rate normalized to 18 decimals (> 0 once configured; 1e18 = 1:1)
      * @param paused Whether the token is currently paused
+     * @param configured True once setTokenConfig has succeeded for the token. Set only by
+     *        setTokenConfig and never cleared. Guarantees decimals in 1..18 and a non-zero rate.
      */
     struct TokenConfig {
         uint8 decimals;
         uint256 normalizedExchangeRate;
         bool paused;
+        bool configured;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -131,9 +138,17 @@ interface IStableYieldAccumulator {
     error ZeroAddress();
 
     /**
-     * @notice Thrown when token decimals exceed 18
+     * @notice Thrown when token decimals are 0 or exceed 18
+     * @dev setTokenConfig accepts decimals in the range 1..18 inclusive
      */
     error InvalidDecimals();
+
+    /**
+     * @notice Thrown when a token's normalized exchange rate is zero
+     * @dev The rate is normalized to 18 decimals, so 1e18 means 1:1. A zero rate was formerly
+     *      read as 1:1; it is now rejected so a token config can never be ambiguous.
+     */
+    error InvalidExchangeRate();
 
     /**
      * @notice Thrown when discount rate exceeds 10000 basis points (100%)
@@ -206,12 +221,23 @@ interface IStableYieldAccumulator {
      */
     error NudgeStreamNotRegistered(address batchMinter, address token);
 
+    /**
+     * @notice Thrown when a token is used before setTokenConfig has configured it
+     * @dev Raised by addYieldStrategy, setRewardToken and by amount normalization /
+     *      denormalization, so an unconfigured token fails closed instead of being silently
+     *      priced as 18 decimals at 1:1 (audit-15 M-01).
+     * @param token The token that has no configuration
+     */
+    error TokenNotConfigured(address token);
+
     /*//////////////////////////////////////////////////////////////
                         YIELD STRATEGY MANAGEMENT
     //////////////////////////////////////////////////////////////*/
 
     /**
      * @notice Adds a new yield strategy to the registry
+     * @dev `token` must already be configured via setTokenConfig, otherwise this reverts
+     *      TokenNotConfigured(token)
      * @param strategy Address of the yield strategy to add
      * @param token Address of the underlying token that the strategy handles
      */
@@ -241,10 +267,13 @@ interface IStableYieldAccumulator {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Sets or updates the configuration for a token
+     * @notice Sets or updates the configuration for a token and marks it configured
+     * @dev Must be called for a token before it is passed to addYieldStrategy or setRewardToken.
+     *      Reverts ZeroAddress for a zero token, InvalidDecimals for decimals outside 1..18 and
+     *      InvalidExchangeRate for a zero rate. The paused flag is preserved.
      * @param token Address of the token
-     * @param decimals Number of decimal places (must be <= 18)
-     * @param normalizedExchangeRate Exchange rate normalized to 18 decimals
+     * @param decimals Number of decimal places (1..18 inclusive)
+     * @param normalizedExchangeRate Exchange rate normalized to 18 decimals; must be > 0 (1e18 = 1:1)
      */
     function setTokenConfig(address token, uint8 decimals, uint256 normalizedExchangeRate) external;
 
@@ -263,7 +292,8 @@ interface IStableYieldAccumulator {
     /**
      * @notice Gets the configuration for a token
      * @param token Address of the token
-     * @return TokenConfig struct with decimals, normalizedExchangeRate, and paused status
+     * @return TokenConfig struct with decimals, normalizedExchangeRate, paused status and the
+     *         configured flag (false, with zero decimals and rate, for a never-configured token)
      */
     function getTokenConfig(address token) external view returns (TokenConfig memory);
 

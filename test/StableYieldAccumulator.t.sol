@@ -825,6 +825,177 @@ contract StableYieldAccumulatorTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+            TOKEN CONFIG FAIL-CLOSED (story 029, audit-15 M-01)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_tokenConfig_FreshTokenIsUnconfigured() public view {
+        IStableYieldAccumulator.TokenConfig memory config = accumulator.getTokenConfig(address(strategyToken1));
+        assertFalse(config.configured, "Fresh token should not be configured");
+        assertEq(config.decimals, 0, "Fresh token decimals should be zero");
+        assertEq(config.normalizedExchangeRate, 0, "Fresh token rate should be zero");
+    }
+
+    function test_setTokenConfig_SetsConfigured() public {
+        accumulator.setTokenConfig(address(strategyToken1), 6, 1e18);
+
+        IStableYieldAccumulator.TokenConfig memory config = accumulator.getTokenConfig(address(strategyToken1));
+        assertTrue(config.configured, "getTokenConfig should report configured");
+
+        (uint8 decimals, uint256 rate, bool paused, bool configured) = accumulator.tokenConfigs(address(strategyToken1));
+        assertEq(decimals, 6, "Getter should return 6 decimals");
+        assertEq(rate, 1e18, "Getter should return 1e18 rate");
+        assertFalse(paused, "Getter should return not paused");
+        assertTrue(configured, "tokenConfigs getter should report configured");
+    }
+
+    function test_setTokenConfig_PreservesPaused() public {
+        accumulator.setTokenConfig(address(strategyToken1), 6, 1e18);
+        accumulator.pauseToken(address(strategyToken1));
+
+        accumulator.setTokenConfig(address(strategyToken1), 18, 2e18);
+
+        IStableYieldAccumulator.TokenConfig memory config = accumulator.getTokenConfig(address(strategyToken1));
+        assertTrue(config.paused, "Reconfiguring should preserve paused");
+        assertTrue(config.configured, "Reconfigured token should stay configured");
+        assertEq(config.decimals, 18, "Decimals should be updated");
+        assertEq(config.normalizedExchangeRate, 2e18, "Rate should be updated");
+    }
+
+    function test_pauseToken_DoesNotConfigure() public {
+        accumulator.pauseToken(address(strategyToken1));
+
+        IStableYieldAccumulator.TokenConfig memory config = accumulator.getTokenConfig(address(strategyToken1));
+        assertTrue(config.paused, "Token should be paused");
+        assertFalse(config.configured, "pauseToken must not configure a token");
+    }
+
+    function _assertUnconfiguredAndZero(address token) internal view {
+        IStableYieldAccumulator.TokenConfig memory config = accumulator.getTokenConfig(token);
+        assertFalse(config.configured, "Rejected call must leave token unconfigured");
+        assertEq(config.decimals, 0, "Rejected call must leave decimals unchanged");
+        assertEq(config.normalizedExchangeRate, 0, "Rejected call must leave rate unchanged");
+    }
+
+    function test_setTokenConfig_RevertIf_ZeroDecimals() public {
+        vm.expectRevert(IStableYieldAccumulator.InvalidDecimals.selector);
+        accumulator.setTokenConfig(address(strategyToken1), 0, 1e18);
+        _assertUnconfiguredAndZero(address(strategyToken1));
+    }
+
+    function test_setTokenConfig_RevertIf_ZeroExchangeRate() public {
+        vm.expectRevert(IStableYieldAccumulator.InvalidExchangeRate.selector);
+        accumulator.setTokenConfig(address(strategyToken1), 6, 0);
+        _assertUnconfiguredAndZero(address(strategyToken1));
+    }
+
+    function test_setTokenConfig_RevertIf_ZeroDecimalsAndZeroRate() public {
+        // Decimals are checked first, so (0, 0) reverts InvalidDecimals
+        vm.expectRevert(IStableYieldAccumulator.InvalidDecimals.selector);
+        accumulator.setTokenConfig(address(strategyToken1), 0, 0);
+        _assertUnconfiguredAndZero(address(strategyToken1));
+    }
+
+    function test_setTokenConfig_ZeroAddressCheckedBeforeInputs() public {
+        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
+        accumulator.setTokenConfig(address(0), 0, 0);
+    }
+
+    function test_addYieldStrategy_RevertIf_TokenNotConfigured() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(IStableYieldAccumulator.TokenNotConfigured.selector, address(strategyToken1))
+        );
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        assertFalse(accumulator.isRegisteredStrategy(address(mockStrategy1)), "Strategy must not be registered");
+    }
+
+    function test_addYieldStrategy_SucceedsAfterTokenConfigured() public {
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        assertTrue(accumulator.isRegisteredStrategy(address(mockStrategy1)), "Strategy should be registered");
+    }
+
+    function test_addYieldStrategy_ZeroAddressPrecedesTokenNotConfigured() public {
+        // Zero strategy with an unconfigured token still reverts ZeroAddress
+        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
+        accumulator.addYieldStrategy(address(0), address(strategyToken1));
+
+        // Zero token reverts ZeroAddress, not TokenNotConfigured(address(0))
+        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
+        accumulator.addYieldStrategy(address(mockStrategy1), address(0));
+    }
+
+    function test_setRewardToken_RevertIf_TokenNotConfigured() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(IStableYieldAccumulator.TokenNotConfigured.selector, address(rewardToken))
+        );
+        accumulator.setRewardToken(address(rewardToken));
+        assertEq(accumulator.rewardToken(), address(0), "Reward token must stay unset");
+    }
+
+    function test_setRewardToken_SucceedsAfterTokenConfigured() public {
+        accumulator.setTokenConfig(address(rewardToken), 18, 1e18);
+        accumulator.setRewardToken(address(rewardToken));
+        assertEq(accumulator.rewardToken(), address(rewardToken), "Reward token should be set");
+    }
+
+    function test_setRewardToken_ZeroAddressPrecedesTokenNotConfigured() public {
+        vm.expectRevert(IStableYieldAccumulator.ZeroAddress.selector);
+        accumulator.setRewardToken(address(0));
+    }
+
+    function test_calculateClaimAmount_RevertIf_RewardTokenUnset() public {
+        accumulator.setTokenConfig(address(strategyToken1), 18, 1e18);
+        accumulator.addYieldStrategy(address(mockStrategy1), address(strategyToken1));
+        mockStrategy1.setBalances(address(strategyToken1), minterAddr, 1000e18, 100e18);
+
+        // rewardToken is unset (address(0)), which is never configured: the quote fails closed
+        vm.expectRevert(abi.encodeWithSelector(IStableYieldAccumulator.TokenNotConfigured.selector, address(0)));
+        accumulator.calculateClaimAmount(new address[](0));
+    }
+
+    /**
+     * @notice audit-15 M-01 headline scenario: gate off, 6-decimal USDT strategy token that is
+     *         not the reward token, 6-decimal USDC reward token
+     * @dev Before story 029 USDT could be registered unconfigured and was priced as 18 decimals,
+     *      so 50,000 USDT of yield was quoted at ~0 USDC. Now registration fails closed, and once
+     *      USDT is configured the quote is correct.
+     */
+    function test_M01_unconfiguredTokenCannotBeRegistered() public {
+        MockERC20WithDecimals usdt = new MockERC20WithDecimals("Tether USD", "USDT", 6);
+        MockERC20WithDecimals usdc = new MockERC20WithDecimals("USD Coin", "USDC", 6);
+        address attacker = makeAddr("attacker");
+
+        assertEq(accumulator.nftMinter(), address(0), "Gate must be off");
+
+        accumulator.setPhlimbo(phlimboAddr);
+        accumulator.setDiscountRate(200); // 2%
+        accumulator.setTokenConfig(address(usdc), 6, 1e18);
+        accumulator.setRewardToken(address(usdc));
+
+        // The vulnerable state (strategy registered, USDT unconfigured) is unreachable
+        vm.expectRevert(abi.encodeWithSelector(IStableYieldAccumulator.TokenNotConfigured.selector, address(usdt)));
+        accumulator.addYieldStrategy(address(mockStrategy1), address(usdt));
+
+        // Configured correctly, the quote is 50,000 USDT * 0.98 = 49,000 USDC
+        accumulator.setTokenConfig(address(usdt), 6, 1e18);
+        accumulator.addYieldStrategy(address(mockStrategy1), address(usdt));
+        uint256 yieldAmount = 50_000e6;
+        mockStrategy1.setBalances(address(usdt), minterAddr, 1_000_000e6, yieldAmount);
+        usdt.mint(address(mockStrategy1), yieldAmount);
+
+        assertEq(accumulator.calculateClaimAmount(new address[](0)), 49_000e6, "Quote should be 49,000 USDC");
+
+        // An unfunded attacker cannot take the yield for ~0 payment
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IERC20Errors.ERC20InsufficientAllowance.selector, address(accumulator), 0, 49_000e6
+            )
+        );
+        accumulator.claim(0, 0, new address[](0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         DISCOUNT RATE
     //////////////////////////////////////////////////////////////*/
 
